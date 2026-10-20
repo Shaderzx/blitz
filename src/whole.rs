@@ -76,7 +76,7 @@ fn cached(args: &[OsString], started: Instant) -> Result<i32> {
     let store = Store::from_env()?;
     let root = workspace_for(args)?;
     let target_dir = inputs::target_dir(&root, args);
-    let (key, mut statcache, files) = key_of(&store, &root, &target_dir, args)?;
+    let (key, mut statcache, files, externals) = key_of(&store, &root, &target_dir, args)?;
 
     if let Some(entry) = load_hit(&store, &key) {
         match restore(&store, &target_dir, &entry) {
@@ -93,15 +93,13 @@ fn cached(args: &[OsString], started: Instant) -> Result<i32> {
             Err(e) => eprintln!("blitz: restoring the cached build failed ({e:#}); rebuilding"),
         }
     }
-    run_and_record(
-        &store,
-        args,
-        &root,
-        &target_dir,
-        &key,
-        &mut statcache,
-        &files,
-    )
+    let build = Build {
+        root: &root,
+        target_dir: &target_dir,
+        files: &files,
+        externals: &externals,
+    };
+    run_and_record(&store, args, &build, &key, &mut statcache)
 }
 
 /// Arguments blitz does not model. Each of them changes what cargo reports or where it writes, so
@@ -147,17 +145,35 @@ fn key_of(
     root: &Path,
     target_dir: &Path,
     args: &[OsString],
-) -> Result<(Digest, StatCache, Vec<PathBuf>)> {
+) -> Result<(Digest, StatCache, Vec<PathBuf>, Vec<inputs::External>)> {
     let cache_root = store.writable_root().map(Path::to_path_buf);
     let mut key = KeyBuilder::new(KEY_DOMAIN);
 
     let files = inputs::walk(root, target_dir)?;
-    inputs::check_path_deps(root, &files)?;
     let mut statcache = StatCache::load(target_dir);
     key.part("file-count", &(files.len() as u64).to_le_bytes());
     for rel in &files {
         key.part("file-path", rel.as_os_str().as_encoded_bytes());
         key.digest("file-digest", &statcache.digest(root, rel)?);
+    }
+
+    // Path dependencies outside the workspace: cargo reads their manifests and build scripts, and
+    // no dep-info file mentions the manifest, so their files are part of the key too.
+    let externals = inputs::external_packages(root, &files)?;
+    key.part("external-count", &(externals.len() as u64).to_le_bytes());
+    for external in &externals {
+        key.part("external-label", external.label.as_bytes());
+        key.part(
+            "external-files",
+            &(external.files.len() as u64).to_le_bytes(),
+        );
+        for rel in &external.files {
+            key.part("external-path", rel.as_os_str().as_encoded_bytes());
+            key.digest(
+                "external-digest",
+                &statcache.digest_labeled(&external.dir, rel, &external.label)?,
+            );
+        }
     }
 
     // The user's cargo config changes the build without touching a workspace file.
@@ -192,7 +208,7 @@ fn key_of(
 
     key.part("os", std::env::consts::OS.as_bytes());
     key.part("arch", std::env::consts::ARCH.as_bytes());
-    Ok((key.finish(), statcache, files))
+    Ok((key.finish(), statcache, files, externals))
 }
 
 /// The arguments that can change the build. Flags that only change the console, and the number of
@@ -205,7 +221,15 @@ fn filtered_args(args: &[OsString]) -> Vec<OsString> {
         match text.as_ref() {
             "-q" | "--quiet" | "-v" | "-vv" | "--verbose" | "--keep-going" => i += 1,
             "--color" | "-j" | "--jobs" => i += 2,
-            _ if text.starts_with("--color=") || text.starts_with("--jobs=") => i += 1,
+            // The target directory changes where output lands, not what the build produces; the
+            // entry stores artifact paths relative to it, so a restore works in another one too.
+            "--target-dir" => i += 2,
+            _ if text.starts_with("--color=")
+                || text.starts_with("--jobs=")
+                || text.starts_with("--target-dir=") =>
+            {
+                i += 1
+            }
             _ if text.starts_with("-j") && text[2..].chars().all(|c| c.is_ascii_digit()) => i += 1,
             _ => {
                 out.push(args[i].clone());
@@ -279,11 +303,9 @@ fn restore(store: &Store, target_dir: &Path, entry: &Entry) -> Result<()> {
 fn run_and_record(
     store: &Store,
     args: &[OsString],
-    root: &Path,
-    target_dir: &Path,
+    build: &Build,
     key: &Digest,
     statcache: &mut StatCache,
-    files: &[PathBuf],
 ) -> Result<i32> {
     let mut full: Vec<OsString> = args.to_vec();
     let end = full.iter().position(|a| a == "--").unwrap_or(full.len());
@@ -311,7 +333,7 @@ fn run_and_record(
     if let Some(stdout) = child.stdout.take() {
         for line in std::io::BufReader::new(stdout).split(b'\n') {
             let Ok(line) = line else { break };
-            collect_artifacts(&line, root, &mut artifacts);
+            collect_artifacts(&line, build.root, &mut artifacts);
         }
     }
     let status = child.wait().context("waiting for cargo")?;
@@ -320,14 +342,9 @@ fn run_and_record(
         store.record("whole-miss", &format!("{} failed", key.short()));
         return Ok(code);
     }
-    let build = Build {
-        root,
-        target_dir,
-        files,
-    };
     if let Err(e) = record(
         store,
-        &build,
+        build,
         &profile_name(args),
         key,
         statcache,
@@ -369,12 +386,13 @@ fn collect_artifacts(line: &[u8], root: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// What a build reads and writes: the workspace root, the target directory it fills, and the files
-/// the walk found under the root.
+/// What a build reads and writes: the workspace root, the target directory it fills, the files the
+/// walk found under the root, and the packages a path dependency pulls in from outside it.
 struct Build<'a> {
     root: &'a Path,
     target_dir: &'a Path,
     files: &'a [PathBuf],
+    externals: &'a [inputs::External],
 }
 
 fn record(
@@ -415,13 +433,17 @@ fn record(
         return Ok(());
     }
     stored.sort_by(|a, b| a.path.cmp(&b.path));
-    let bases = inputs::package_roots(root, files);
-    let extra = collect_extra(
+    // Build scripts inside an external package resolve their relative paths against that package,
+    // so its root is a base too.
+    let mut bases = inputs::package_roots(root, files);
+    bases.extend(build.externals.iter().map(|e| e.dir.clone()));
+    let contexts = Contexts {
         root,
         target_dir,
-        &profile_dirs(artifacts, target_dir),
-        &bases,
-    );
+        externals: build.externals,
+        bases: &bases,
+    };
+    let extra = collect_extra(&contexts, &profile_dirs(artifacts, target_dir));
     let entry = Entry {
         version: ENTRY_VERSION,
         profile: profile.to_string(),
@@ -464,18 +486,21 @@ fn profile_name(args: &[OsString]) -> String {
     "dev".to_string()
 }
 
+/// Everything the extra-input scan needs in order to decide what is worth recording.
+struct Contexts<'a> {
+    root: &'a Path,
+    target_dir: &'a Path,
+    externals: &'a [inputs::External],
+    bases: &'a [PathBuf],
+}
+
 /// Inputs the workspace walk cannot see: files a compiler or build script read from outside the
 /// workspace, and the environment variables a build script asked cargo to watch.
 ///
 /// Every dep-info file and build script output in the profile directory is read, not only the ones
 /// this build wrote. Cargo leaves a build script alone when its own fingerprint says nothing
 /// changed, and that script's `rerun-if-env-changed` must still invalidate our entry.
-fn collect_extra(
-    root: &Path,
-    target_dir: &Path,
-    profile_dirs: &[PathBuf],
-    bases: &[PathBuf],
-) -> Vec<ExtraInput> {
+fn collect_extra(contexts: &Contexts, profile_dirs: &[PathBuf]) -> Vec<ExtraInput> {
     let mut files: BTreeMap<String, Option<Digest>> = BTreeMap::new();
     let mut envs: BTreeMap<String, Option<String>> = BTreeMap::new();
     for dir in profile_dirs {
@@ -489,7 +514,7 @@ fn collect_extra(
                     continue;
                 };
                 for prereq in dep_info_prereqs(&text) {
-                    if let Some(path) = recordable(root, target_dir, Path::new(&prereq)) {
+                    if let Some(path) = recordable(contexts, Path::new(&prereq)) {
                         let digest = Digest::of_file(Path::new(&path)).ok();
                         files.insert(path, digest);
                     }
@@ -506,7 +531,7 @@ fn collect_extra(
                         let name = name.trim().to_string();
                         envs.insert(name.clone(), std::env::var(&name).ok());
                     } else if let Some(path) = line.strip_prefix("cargo:rerun-if-changed=") {
-                        for path in recordable_watched(root, target_dir, bases, path.trim()) {
+                        for path in recordable_watched(contexts, path.trim()) {
                             let digest = Digest::of_file(Path::new(&path)).ok();
                             files.insert(path, digest);
                         }
@@ -527,19 +552,12 @@ fn collect_extra(
 }
 
 /// The absolute path of an input worth recording, or `None` when something else already covers it:
-/// the workspace walk covers workspace files, `Cargo.lock` pins the registry and git checkouts, and
-/// the target directory is rewritten by the build itself.
-fn recordable(root: &Path, target_dir: &Path, path: &Path) -> Option<String> {
-    let abs = inputs::absolute_from(root, path);
-    if !worth_recording(root, target_dir, &abs) {
-        return None;
-    }
-    Some(
-        fs::canonicalize(&abs)
-            .unwrap_or(abs)
-            .to_string_lossy()
-            .into_owned(),
-    )
+/// the workspace walk covers workspace files, the key already covers external path dependencies,
+/// `Cargo.lock` pins the registry and git checkouts, and the target directory is rewritten by the
+/// build itself.
+fn recordable(contexts: &Contexts, path: &Path) -> Option<String> {
+    let abs = inputs::absolute_from(contexts.root, path);
+    worth_recording(contexts, &abs).then(|| canonical_string(&abs))
 }
 
 /// Every external file a `rerun-if-changed` path can point at.
@@ -548,19 +566,15 @@ fn recordable(root: &Path, target_dir: &Path, path: &Path) -> Option<String> {
 /// does not say which package wrote it, so every package root is tried. A path that resolves
 /// nowhere is still recorded for every candidate root: its later appearance must invalidate the
 /// entry, and that is what an absent digest means.
-fn recordable_watched(
-    root: &Path,
-    target_dir: &Path,
-    bases: &[PathBuf],
-    path: &str,
-) -> Vec<String> {
+fn recordable_watched(contexts: &Contexts, path: &str) -> Vec<String> {
     let path = Path::new(path);
     if path.is_absolute() {
-        return recordable(root, target_dir, path).into_iter().collect();
+        return recordable(contexts, path).into_iter().collect();
     }
-    let mut out: Vec<String> = bases
+    let mut out: Vec<String> = contexts
+        .bases
         .iter()
-        .filter_map(|base| recordable_relative(root, target_dir, base, path))
+        .filter_map(|base| recordable_relative(contexts, base, path))
         .collect();
     out.sort();
     out.dedup();
@@ -568,26 +582,32 @@ fn recordable_watched(
 }
 
 /// A relative `rerun-if-changed` path, resolved against one package root.
-fn recordable_relative(root: &Path, target_dir: &Path, base: &Path, path: &Path) -> Option<String> {
+fn recordable_relative(contexts: &Contexts, base: &Path, path: &Path) -> Option<String> {
     let abs = base.join(path);
-    if !worth_recording(root, target_dir, &abs) {
-        return None;
-    }
-    Some(
-        fs::canonicalize(&abs)
-            .unwrap_or(abs)
-            .to_string_lossy()
-            .into_owned(),
-    )
+    worth_recording(contexts, &abs).then(|| canonical_string(&abs))
 }
 
-fn worth_recording(root: &Path, target_dir: &Path, abs: &Path) -> bool {
+fn canonical_string(path: &Path) -> String {
+    fs::canonicalize(path)
+        .unwrap_or_else(|_| inputs::normalize(path))
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn worth_recording(contexts: &Contexts, abs: &Path) -> bool {
     // Canonical paths, because a relative path such as `helper/../../data.txt` starts with the root
     // textually while pointing outside it. Filtering that as a workspace file would leave an
     // edited external input invisible to the key.
     let real = fs::canonicalize(abs).unwrap_or_else(|_| inputs::normalize(abs));
-    let root = fs::canonicalize(root).unwrap_or_else(|_| inputs::normalize(root));
-    if real.starts_with(&root) || real.starts_with(target_dir) {
+    let root = fs::canonicalize(contexts.root).unwrap_or_else(|_| inputs::normalize(contexts.root));
+    if real.starts_with(&root) || real.starts_with(contexts.target_dir) {
+        return false;
+    }
+    if contexts
+        .externals
+        .iter()
+        .any(|external| real.starts_with(&external.dir))
+    {
         return false;
     }
     if let Some(home) = inputs::cargo_home() {

@@ -200,52 +200,120 @@ pub fn package_roots(root: &Path, files: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
-/// Refuses the whole-build cache when a path dependency lives outside the workspace root.
+/// A package outside the workspace that a path dependency pulls in.
+pub struct External {
+    /// The label from the manifest entry (`../helper`), the same in every checkout, so the key
+    /// never contains an absolute path.
+    pub label: String,
+    /// Where that entry resolves to now.
+    pub dir: PathBuf,
+    /// Every file under `dir`, relative to it.
+    pub files: Vec<PathBuf>,
+}
+
+/// Every outside package reachable through `path` dependencies, walked depth first.
 ///
-/// Cargo reads that dependency's manifest and build script, and neither a dep-info file nor a
-/// `rerun-if-*` directive mentions the manifest, so an edit there would be invisible to the key.
-/// Nothing else in the input set covers it, so plain cargo runs instead of risking a stale hit.
-pub fn check_path_deps(root: &Path, files: &[PathBuf]) -> Result<()> {
+/// Cargo reads those manifests and build scripts, and no dep-info file mentions the manifest, so an
+/// edit there would otherwise be invisible to the key. Following the dependencies transitively
+/// costs a walk of each external crate, which is small next to the build it protects.
+pub fn external_packages(root: &Path, files: &[PathBuf]) -> Result<Vec<External>> {
+    let root_real = fs::canonicalize(root).unwrap_or_else(|_| normalize(root));
+    let mut queue: Vec<(String, PathBuf)> = Vec::new();
+    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
     for rel in files {
         if rel.file_name() != Some(OsStr::new("Cargo.toml")) {
             continue;
         }
-        let manifest = root.join(rel);
-        let Ok(text) = fs::read_to_string(&manifest) else {
-            continue;
-        };
-        for value in path_values(&text) {
-            let base = root.join(rel).parent().unwrap_or(root).to_path_buf();
-            let dir = absolute_from(&base, Path::new(&value));
-            if !dir.starts_with(root) {
-                bail!(
-                    "path dependency {} lives outside the workspace",
-                    dir.display()
+        let dir = root.join(rel).parent().unwrap_or(root).to_path_buf();
+        collect_escaping(&root_real, &dir, "", &mut queue, &mut seen)?;
+    }
+
+    let mut out = Vec::new();
+    while let Some((label, dir)) = queue.pop() {
+        let walked = walk(&dir, &dir.join("target"))?;
+        for rel in &walked {
+            if rel.file_name() == Some(OsStr::new("Cargo.toml")) {
+                let sub = dir.join(rel).parent().unwrap_or(&dir).to_path_buf();
+                let sub_label = format!(
+                    "{label}/{}",
+                    rel.parent().unwrap_or(Path::new("")).display()
                 );
+                collect_escaping(&root_real, &sub, &sub_label, &mut queue, &mut seen)?;
             }
         }
+        out.push(External {
+            label,
+            dir,
+            files: walked,
+        });
+    }
+    out.sort_by(|a, b| a.label.cmp(&b.label));
+    Ok(out)
+}
+
+/// Queues the `path` dependencies of one manifest that resolve outside the workspace.
+fn collect_escaping(
+    root: &Path,
+    manifest_dir: &Path,
+    prefix: &str,
+    queue: &mut Vec<(String, PathBuf)>,
+    seen: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    let manifest = manifest_dir.join("Cargo.toml");
+    let Ok(text) = fs::read_to_string(&manifest) else {
+        return Ok(());
+    };
+    for value in path_values(&text) {
+        let dir = absolute_from(manifest_dir, Path::new(&value));
+        let real = fs::canonicalize(&dir).unwrap_or_else(|_| normalize(&dir));
+        if real.starts_with(root) || !seen.insert(real.clone()) {
+            continue;
+        }
+        let label = if prefix.is_empty() {
+            value
+        } else {
+            format!("{prefix}/{value}")
+        };
+        queue.push((label, real));
     }
     Ok(())
 }
 
-/// The values of `path = "..."` keys in a manifest. Keys outside dependency tables (`[[bin]] path`,
-/// `[lib] path`) point at files inside the package, which the walk already covers.
+/// The values of `path = "..."` keys in a manifest, in both the table form
+/// (`[dependencies.foo] path = ".."`) and the inline form (`foo = { path = ".." }`).
+/// Keys outside dependency tables (`[[bin]] path`, `[lib] path`) point at files inside the package,
+/// which the walk already covers.
 fn path_values(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in text.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if key.trim() != "path" {
-            continue;
-        }
-        let value = value.trim().trim_matches('"').trim_matches('\'');
-        if !value.is_empty() {
-            out.push(value.to_string());
+        let line = line.split('#').next().unwrap_or("");
+        let mut from = 0;
+        while let Some(found) = line[from..].find("path") {
+            let start = from + found;
+            let after = &line[start + "path".len()..];
+            let key_like = line[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|c| c == '{' || c == ',' || c.is_whitespace());
+            let rest = after.trim_start();
+            if key_like {
+                if let Some(value) = rest.strip_prefix('=').and_then(quoted) {
+                    out.push(value);
+                }
+            }
+            from = start + "path".len();
         }
     }
     out
+}
+
+/// The first quoted string in `text`, if it starts with a quote.
+fn quoted(text: &str) -> Option<String> {
+    let text = text.trim_start();
+    let quote = text.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+    let rest = &text[quote.len_utf8()..];
+    let end = rest.find(quote)?;
+    Some(rest[..end].to_string())
 }
 
 /// Digests of the files the walk found, cached by stat so unchanged files are never read.
@@ -289,11 +357,20 @@ impl StatCache {
         }
     }
 
-    /// The digest of `root/rel`, re-hashed only when its size, mtime or inode moved.
-    pub fn digest(&mut self, root: &Path, rel: &Path) -> Result<Digest> {
-        let full = root.join(rel);
+    /// The digest of `base/rel`, re-hashed only when its size, mtime or inode moved. `label` keeps
+    /// the cache keys of an external package apart from the workspace's own files.
+    pub fn digest(&mut self, base: &Path, rel: &Path) -> Result<Digest> {
+        self.digest_labeled(base, rel, "")
+    }
+
+    /// The digest of `base/rel`, keyed under `label`, for files outside the workspace root.
+    pub fn digest_labeled(&mut self, base: &Path, rel: &Path, label: &str) -> Result<Digest> {
+        let full = base.join(rel);
         let meta = fs::metadata(&full).with_context(|| format!("statting {}", full.display()))?;
-        let key = key_of(rel);
+        let mut key = key_of(rel);
+        if !label.is_empty() {
+            key = format!("{label}\u{1f}{key}");
+        }
         let size = meta.len();
         let mtime = mtime_ns(&meta);
         let inode = inode(&meta);
