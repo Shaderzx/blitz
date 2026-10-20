@@ -7,7 +7,9 @@
 //!   rustc invocation is answered from the store when its inputs were compiled before.
 
 mod cli;
+mod depinfo;
 mod hash;
+mod normalize;
 mod store;
 mod toolchain;
 mod whole;
