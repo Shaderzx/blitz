@@ -23,7 +23,10 @@ pub struct Normalizer {
 
 impl Normalizer {
     pub fn new() -> Normalizer {
-        Normalizer { roots: Vec::new(), preferred: Vec::new() }
+        Normalizer {
+            roots: Vec::new(),
+            preferred: Vec::new(),
+        }
     }
 
     /// Rewrites every occurrence of `path` to `placeholder`.
@@ -40,7 +43,8 @@ impl Normalizer {
             }
             self.roots.push((form, placeholder));
         }
-        self.roots.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.1.cmp(b.1)));
+        self.roots
+            .sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.1.cmp(b.1)));
     }
 
     pub fn normalize(&self, text: &str) -> String {

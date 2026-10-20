@@ -16,7 +16,10 @@ pub fn rustc_identity(rustc: &Path, cache_root: Option<&Path>) -> Result<String>
     k.part("path", rustc.as_os_str().as_encoded_bytes());
     k.part("len", &meta.len().to_le_bytes());
     if let Ok(m) = meta.modified() {
-        let nanos = m.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let nanos = m
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
         k.part("mtime", &nanos.to_le_bytes());
     }
     #[cfg(unix)]
@@ -31,7 +34,10 @@ pub fn rustc_identity(rustc: &Path, cache_root: Option<&Path>) -> Result<String>
             return Ok(s);
         }
     }
-    let out = Command::new(rustc).arg("-vV").output().with_context(|| format!("running {} -vV", rustc.display()))?;
+    let out = Command::new(rustc)
+        .arg("-vV")
+        .output()
+        .with_context(|| format!("running {} -vV", rustc.display()))?;
     if !out.status.success() {
         bail!("{} -vV failed", rustc.display());
     }
@@ -68,7 +74,10 @@ pub fn resolve_rustc(dir: &Path) -> Result<PathBuf> {
                     return Ok(p);
                 }
             }
-            let out = Command::new("rustup").args(["which", "rustc"]).current_dir(dir).output();
+            let out = Command::new("rustup")
+                .args(["which", "rustc"])
+                .current_dir(dir)
+                .output();
             if let Ok(out) = out {
                 if out.status.success() {
                     return Ok(PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()));

@@ -57,10 +57,7 @@ pub fn flag_value(args: &[OsString], name: &str) -> Option<OsString> {
         if text == name {
             return it.next().cloned();
         }
-        if let Some(value) = text
-            .strip_prefix(name)
-            .and_then(|rest| rest.strip_prefix('='))
-        {
+        if let Some(value) = text.strip_prefix(name).and_then(|rest| rest.strip_prefix('=')) {
             return Some(OsString::from(value));
         }
     }
@@ -151,10 +148,7 @@ pub fn walk(root: &Path, skip: &Path) -> Result<Vec<PathBuf>> {
         if kind.is_symlink() && !fs::metadata(path).is_ok_and(|m| m.is_file()) {
             // A symlinked directory or a dangling link hides inputs the walk cannot see. Refuse the
             // whole-build cache rather than risk a stale hit.
-            bail!(
-                "{} is a symlink that does not point at a file",
-                path.display()
-            );
+            bail!("{} is a symlink that does not point at a file", path.display());
         }
         let rel = path
             .strip_prefix(root)
@@ -234,10 +228,7 @@ pub fn external_packages(root: &Path, files: &[PathBuf]) -> Result<Vec<External>
         for rel in &walked {
             if rel.file_name() == Some(OsStr::new("Cargo.toml")) {
                 let sub = dir.join(rel).parent().unwrap_or(&dir).to_path_buf();
-                let sub_label = format!(
-                    "{label}/{}",
-                    rel.parent().unwrap_or(Path::new("")).display()
-                );
+                let sub_label = format!("{label}/{}", rel.parent().unwrap_or(Path::new("")).display());
                 collect_escaping(&root_real, &sub, &sub_label, &mut queue, &mut seen)?;
             }
         }

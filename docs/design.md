@@ -70,9 +70,14 @@ without spawning rustup in the common case.
    `compiler-artifact` messages for packages whose `manifest_path` is inside the workspace root:
    their `filenames` and `executable`. Also forward `"reason":"build-finished"` success.
    If cargo fails, return its exit code and store nothing.
-6. After a successful miss build, record extra inputs that the walk did not cover:
-   - files listed in the workspace crates' dep-info (`<target>/<profile>/deps/*.d` written in this
-     build; parse the first rule's prerequisites) that are outside the workspace root and outside
+6. After a successful miss build, record extra inputs that the walk did not cover. These are read
+   from every dep-info file and build script output in the profile directories, not only the ones
+   this build wrote, because cargo can skip a build script whose watched variable still matters.
+   Extra inputs are validated on lookup, not part of the key, so a toggling external input costs
+   one miss each way. Path dependencies outside the workspace root are walked and keyed like the
+   workspace itself (labelled by the manifest's path value, so no absolute path enters the key).
+   - files listed in the workspace crates' dep-info (`<target>/<profile>/deps/*.d`; parse the first
+     rule's prerequisites, paths canonicalised first) that are outside the workspace root and outside
      `$CARGO_HOME/registry` and `$CARGO_HOME/git` (registry and git sources are pinned by
      `Cargo.lock`), with their digests;
    - for every build script output (`<target>/<profile>/build/*/output` written in this build):

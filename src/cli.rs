@@ -55,7 +55,11 @@ fn dispatch(args: &[OsString]) -> Result<i32> {
         "stats" => stats(),
         "cache-dir" => {
             for (root, writable) in Store::from_env()?.roots() {
-                println!("{} ({})", root.display(), if writable { "read-write" } else { "read-only" });
+                println!(
+                    "{} ({})",
+                    root.display(),
+                    if writable { "read-write" } else { "read-only" }
+                );
             }
             Ok(0)
         }
@@ -73,14 +77,19 @@ pub fn run_cargo(sub: &str, args: &[OsString], wrap: bool) -> Result<i32> {
     let mut cmd = Command::new(cargo_bin());
     cmd.arg(sub).args(args);
     if wrap && std::env::var_os("RUSTC_WRAPPER").is_none_or(|w| w.is_empty()) {
-        cmd.env("RUSTC_WRAPPER", std::env::current_exe().context("locating the blitz binary")?);
+        cmd.env(
+            "RUSTC_WRAPPER",
+            std::env::current_exe().context("locating the blitz binary")?,
+        );
     }
     let status = cmd.status().context("running cargo")?;
     Ok(status.code().unwrap_or(1))
 }
 
 pub fn cargo_bin() -> OsString {
-    std::env::var_os("CARGO").filter(|c| !c.is_empty()).unwrap_or_else(|| "cargo".into())
+    std::env::var_os("CARGO")
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| "cargo".into())
 }
 
 fn stats() -> Result<i32> {

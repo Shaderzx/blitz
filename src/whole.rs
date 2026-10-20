@@ -48,12 +48,7 @@ const KEY_ENV: &[&str] = &[
 
 /// `CARGO_*` variables that do not change what is built: where the cache lives, how many jobs run,
 /// and how the console looks.
-const KEY_ENV_SKIP: &[&str] = &[
-    "CARGO_HOME",
-    "CARGO_TARGET_DIR",
-    "CARGO_MAKEFLAGS",
-    "CARGO_BUILD_JOBS",
-];
+const KEY_ENV_SKIP: &[&str] = &["CARGO_HOME", "CARGO_TARGET_DIR", "CARGO_MAKEFLAGS", "CARGO_BUILD_JOBS"];
 
 pub fn build(args: &[OsString]) -> Result<i32> {
     if std::env::var("BLITZ_DISABLE").is_ok_and(|v| v == "1") {
@@ -83,10 +78,7 @@ fn cached(args: &[OsString], started: Instant) -> Result<i32> {
             Ok(()) => {
                 let _ = statcache.save(&target_dir);
                 let ms = started.elapsed().as_millis();
-                eprintln!(
-                    "    Finished `{}` profile [restored by blitz] in {ms}ms",
-                    entry.profile
-                );
+                eprintln!("    Finished `{}` profile [restored by blitz] in {ms}ms", entry.profile);
                 store.record("whole-hit", &key.short());
                 return Ok(0);
             }
@@ -115,9 +107,7 @@ fn unsupported(args: &[OsString]) -> Option<String> {
             "--message-format" => "--message-format is the caller's to control",
             "--build-plan" => "--build-plan is unstable",
             "--unit-graph" => "--unit-graph is unstable",
-            "--out-dir" | "--artifact-dir" => {
-                "--out-dir/--artifact-dir write outside the target directory"
-            }
+            "--out-dir" | "--artifact-dir" => "--out-dir/--artifact-dir write outside the target directory",
             "--timings" => "--timings reports a build blitz would not run",
             _ if flag.starts_with("-Z") => "-Z unstable flags are not modeled",
             _ => continue,
@@ -129,8 +119,7 @@ fn unsupported(args: &[OsString]) -> Option<String> {
 
 fn workspace_for(args: &[OsString]) -> Result<PathBuf> {
     let cwd = inputs::cwd();
-    let root =
-        inputs::workspace_root(&cwd).context("no cargo workspace around the current directory")?;
+    let root = inputs::workspace_root(&cwd).context("no cargo workspace around the current directory")?;
     if let Some(manifest) = inputs::flag_value(args, "--manifest-path") {
         let manifest = inputs::absolute_from(&cwd, Path::new(&manifest));
         if !manifest.starts_with(&root) {
@@ -163,10 +152,7 @@ fn key_of(
     key.part("external-count", &(externals.len() as u64).to_le_bytes());
     for external in &externals {
         key.part("external-label", external.label.as_bytes());
-        key.part(
-            "external-files",
-            &(external.files.len() as u64).to_le_bytes(),
-        );
+        key.part("external-files", &(external.files.len() as u64).to_le_bytes());
         for rel in &external.files {
             key.part("external-path", rel.as_os_str().as_encoded_bytes());
             key.digest(
@@ -224,10 +210,7 @@ fn filtered_args(args: &[OsString]) -> Vec<OsString> {
             // The target directory changes where output lands, not what the build produces; the
             // entry stores artifact paths relative to it, so a restore works in another one too.
             "--target-dir" => i += 2,
-            _ if text.starts_with("--color=")
-                || text.starts_with("--jobs=")
-                || text.starts_with("--target-dir=") =>
-            {
+            _ if text.starts_with("--color=") || text.starts_with("--jobs=") || text.starts_with("--target-dir=") => {
                 i += 1
             }
             _ if text.starts_with("-j") && text[2..].chars().all(|c| c.is_ascii_digit()) => i += 1,
@@ -254,9 +237,7 @@ fn key_env() -> Vec<(OsString, OsString)> {
     let mut out = Vec::new();
     for (name, value) in std::env::vars_os() {
         let Some(text) = name.to_str() else { continue };
-        let keep = (text.starts_with("CARGO_")
-            && !KEY_ENV_SKIP.contains(&text)
-            && !text.starts_with("CARGO_TERM_"))
+        let keep = (text.starts_with("CARGO_") && !KEY_ENV_SKIP.contains(&text) && !text.starts_with("CARGO_TERM_"))
             || KEY_ENV.contains(&text)
             || extra.iter().any(|e| e == text);
         if keep {
@@ -291,11 +272,7 @@ fn extra_inputs_unchanged(extra: &[ExtraInput]) -> bool {
 fn restore(store: &Store, target_dir: &Path, entry: &Entry) -> Result<()> {
     for artifact in &entry.artifacts {
         let dest = target_dir.join(&artifact.path);
-        store.materialize(
-            &artifact.digest,
-            &dest,
-            if artifact.executable { 0o755 } else { 0o644 },
-        )?;
+        store.materialize(&artifact.digest, &dest, if artifact.executable { 0o755 } else { 0o644 })?;
     }
     Ok(())
 }
@@ -309,10 +286,7 @@ fn run_and_record(
 ) -> Result<i32> {
     let mut full: Vec<OsString> = args.to_vec();
     let end = full.iter().position(|a| a == "--").unwrap_or(full.len());
-    full.insert(
-        end,
-        OsString::from("--message-format=json-render-diagnostics"),
-    );
+    full.insert(end, OsString::from("--message-format=json-render-diagnostics"));
 
     let mut cmd = Command::new(crate::cli::cargo_bin());
     cmd.arg("build").args(&full);
@@ -342,14 +316,7 @@ fn run_and_record(
         store.record("whole-miss", &format!("{} failed", key.short()));
         return Ok(code);
     }
-    if let Err(e) = record(
-        store,
-        build,
-        &profile_name(args),
-        key,
-        statcache,
-        &artifacts,
-    ) {
+    if let Err(e) = record(store, build, &profile_name(args), key, statcache, &artifacts) {
         eprintln!("blitz: could not record the whole-build entry: {e:#}");
     }
     Ok(code)
@@ -513,7 +480,7 @@ fn collect_extra(contexts: &Contexts, profile_dirs: &[PathBuf]) -> Vec<ExtraInpu
                 let Ok(text) = fs::read_to_string(&path) else {
                     continue;
                 };
-                for prereq in dep_info_prereqs(&text) {
+                for prereq in crate::depinfo::parse_prerequisites(&text) {
                     if let Some(path) = recordable(contexts, Path::new(&prereq)) {
                         let digest = Digest::of_file(Path::new(&path)).ok();
                         files.insert(path, digest);
@@ -544,10 +511,7 @@ fn collect_extra(contexts: &Contexts, profile_dirs: &[PathBuf]) -> Vec<ExtraInpu
         .into_iter()
         .map(|(path, digest)| ExtraInput::File { path, digest })
         .collect();
-    out.extend(
-        envs.into_iter()
-            .map(|(name, value)| ExtraInput::Env { name, value }),
-    );
+    out.extend(envs.into_iter().map(|(name, value)| ExtraInput::Env { name, value }));
     out
 }
 
@@ -618,40 +582,6 @@ fn worth_recording(contexts: &Contexts, abs: &Path) -> bool {
     true
 }
 
-/// The prerequisites of the first rule in a makefile-style dep-info file.
-fn dep_info_prereqs(text: &str) -> Vec<String> {
-    let joined = text.replace("\\\r\n", " ").replace("\\\n", " ");
-    let first = joined
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("");
-    let Some((_, rest)) = first.split_once(':') else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut chars = rest.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => {
-                if let Some(next) = chars.next() {
-                    cur.push(next);
-                }
-            }
-            c if c.is_whitespace() => {
-                if !cur.is_empty() {
-                    out.push(std::mem::take(&mut cur));
-                }
-            }
-            c => cur.push(c),
-        }
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
-}
-
 #[cfg(unix)]
 fn is_executable(meta: &fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -684,10 +614,7 @@ struct Artifact {
 enum ExtraInput {
     /// An input file outside the workspace. `None` means the file did not exist when recorded, so
     /// its appearance is a change too.
-    File {
-        path: String,
-        digest: Option<Digest>,
-    },
+    File { path: String, digest: Option<Digest> },
     /// `cargo:rerun-if-env-changed`: the value cargo saw, `None` when it was unset.
     Env { name: String, value: Option<String> },
 }

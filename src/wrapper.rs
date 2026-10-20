@@ -77,7 +77,10 @@ const GLUED_FLAGS: &[&str] = &["-C", "-Z", "-L", "-l", "-W", "-A", "-D", "-F"];
 /// `blitz rustc ...` typed by a user still means the `cargo rustc` subcommand.
 pub fn looks_like_compiler(arg: &OsStr) -> bool {
     let p = Path::new(arg);
-    let name = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = p
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let compiler = name == "rustc" || name == "clippy-driver" || name.ends_with("-rustc");
     compiler && (p.components().count() > 1 || std::env::var_os("CARGO_PKG_NAME").is_some())
 }
@@ -182,7 +185,10 @@ impl Ctx<'_> {
     fn key(&self, rustc: &OsStr, args: &[OsString], inv: &Invocation) -> Result<Option<Digest>> {
         let cache_root = self.store.writable_root().map(Path::to_path_buf);
         let mut k = KeyBuilder::new("blitz-unit-v1");
-        k.digest("rustc", &toolchain::rustc_digest(Path::new(rustc), cache_root.as_deref())?);
+        k.digest(
+            "rustc",
+            &toolchain::rustc_digest(Path::new(rustc), cache_root.as_deref())?,
+        );
         for arg in args {
             k.part("arg", self.normalizer.normalize(&arg.to_string_lossy()).as_bytes());
         }
@@ -220,7 +226,10 @@ impl Ctx<'_> {
         if immutable_source(&manifest, &cargo_home) {
             // crates.io and git sources cannot change for a given path, and Cargo.lock pins both.
             k.part("sources", b"immutable");
-            k.part("manifest", self.normalizer.normalize(&manifest.to_string_lossy()).as_bytes());
+            k.part(
+                "manifest",
+                self.normalizer.normalize(&manifest.to_string_lossy()).as_bytes(),
+            );
             return Ok(Some(()));
         }
         let dir = self.prepass_dir();
@@ -232,8 +241,11 @@ impl Ctx<'_> {
         k.part("sources", b"dep-info");
         let mut seen = BTreeSet::new();
         for dep in info.prerequisites {
-            let path =
-                if Path::new(&dep).is_absolute() { PathBuf::from(&dep) } else { std::env::current_dir()?.join(&dep) };
+            let path = if Path::new(&dep).is_absolute() {
+                PathBuf::from(&dep)
+            } else {
+                std::env::current_dir()?.join(&dep)
+            };
             let key_path = self.normalizer.normalize(&path.to_string_lossy());
             if !seen.insert(key_path.clone()) {
                 continue;
@@ -251,14 +263,19 @@ impl Ctx<'_> {
         let mut env_deps = info.env_deps;
         env_deps.sort();
         for (name, value) in env_deps {
-            let value = value.map(|v| self.normalizer.normalize(&v)).unwrap_or_else(|| "<unset>".to_string());
+            let value = value
+                .map(|v| self.normalizer.normalize(&v))
+                .unwrap_or_else(|| "<unset>".to_string());
             k.part("env-dep", format!("{name}={value}").as_bytes());
         }
         Ok(Some(()))
     }
 
     fn prepass_dir(&self) -> PathBuf {
-        self.target_root.join("blitz").join("prepass").join(format!("{}-{}", std::process::id(), unique()))
+        self.target_root
+            .join("blitz")
+            .join("prepass")
+            .join(format!("{}-{}", std::process::id(), unique()))
     }
 
     /// Restores the entry when every blob is present. False means "compile it".
@@ -280,7 +297,10 @@ impl Ctx<'_> {
             }
             remember_digest(self.target_root, &dest, &output.digest);
         }
-        replay(&self.normalizer.denormalize(&entry.stdout), &self.normalizer.denormalize(&entry.stderr))?;
+        replay(
+            &self.normalizer.denormalize(&entry.stdout),
+            &self.normalizer.denormalize(&entry.stderr),
+        )?;
         Ok(true)
     }
 
@@ -324,7 +344,11 @@ impl Ctx<'_> {
                 self.store.put_file(&path)?
             };
             remember_digest(self.target_root, &path, &digest);
-            outputs.push(UnitOutput { name, digest, mode: 0o644 });
+            outputs.push(UnitOutput {
+                name,
+                digest,
+                mode: 0o644,
+            });
         }
         if !outputs.iter().any(|o| !is_dep_info(&o.name)) {
             // An entry with nothing to restore would be a hit that leaves the unit unbuilt.
@@ -344,7 +368,10 @@ impl Ctx<'_> {
 
     fn output_prefixes(&self) -> Vec<String> {
         let name = self.krate.replace('-', "_");
-        vec![format!("lib{name}{}.", self.extra_filename), format!("{name}{}.", self.extra_filename)]
+        vec![
+            format!("lib{name}{}.", self.extra_filename),
+            format!("{name}{}.", self.extra_filename),
+        ]
     }
 }
 
@@ -440,7 +467,9 @@ fn cargo_home() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("CARGO_HOME").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(home));
     }
-    std::env::var_os("HOME").filter(|h| !h.is_empty()).map(|h| PathBuf::from(h).join(".cargo"))
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(|h| PathBuf::from(h).join(".cargo"))
 }
 
 fn build_normalizer(target_root: &Path) -> Normalizer {
@@ -460,11 +489,16 @@ fn build_normalizer(target_root: &Path) -> Normalizer {
 
 /// True when the crate's sources live in an immutable place: a registry extraction or a git checkout.
 fn immutable_source(manifest: &Path, cargo_home: &Path) -> bool {
-    let roots = [cargo_home.join("registry").join("src"), cargo_home.join("git").join("checkouts")];
+    let roots = [
+        cargo_home.join("registry").join("src"),
+        cargo_home.join("git").join("checkouts"),
+    ];
     let forms = normalize::variants(manifest);
     roots.iter().any(|root| {
         let root_forms = normalize::variants(root);
-        forms.iter().any(|m| root_forms.iter().any(|r| Path::new(m).starts_with(r)))
+        forms
+            .iter()
+            .any(|m| root_forms.iter().any(|r| Path::new(m).starts_with(r)))
     })
 }
 
@@ -487,9 +521,16 @@ fn dep_info(rustc: &OsStr, args: &[OsString], dir: &Path) -> Option<DepInfo> {
     if !status.success() {
         return None;
     }
-    let file = fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "d"))?;
+    let file = fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "d"))?;
     let text = String::from_utf8_lossy(&fs::read(&file).ok()?).into_owned();
-    Some(DepInfo { prerequisites: depinfo::parse_prerequisites(&text), env_deps: depinfo::parse_env_deps(&text) })
+    Some(DepInfo {
+        prerequisites: depinfo::parse_prerequisites(&text),
+        env_deps: depinfo::parse_env_deps(&text),
+    })
 }
 
 /// The original arguments with output selection replaced by a dep-info-only run into `dir`.
@@ -521,7 +562,10 @@ fn key_env(normalizer: &Normalizer) -> BTreeMap<String, String> {
     for (key, value) in std::env::vars_os() {
         let name = key.to_string_lossy().into_owned();
         let interesting = (name.starts_with("CARGO_") && name != "CARGO_MAKEFLAGS" && name != "CARGO_HOME")
-            || matches!(name.as_str(), "RUSTC_BOOTSTRAP" | "OUT_DIR" | "SDKROOT" | "MACOSX_DEPLOYMENT_TARGET");
+            || matches!(
+                name.as_str(),
+                "RUSTC_BOOTSTRAP" | "OUT_DIR" | "SDKROOT" | "MACOSX_DEPLOYMENT_TARGET"
+            );
         if interesting {
             out.insert(name, normalizer.normalize(&value.to_string_lossy()));
         }
@@ -619,15 +663,21 @@ fn remember_digest(target_root: &Path, path: &Path, digest: &Digest) {
     let Ok(memo_path) = memo_path(target_root, path) else {
         return;
     };
-    let memo =
-        Memo { path: path.to_string_lossy().into_owned(), len: meta.len(), mtime: mtime_ns(&meta), digest: *digest };
+    let memo = Memo {
+        path: path.to_string_lossy().into_owned(),
+        len: meta.len(),
+        mtime: mtime_ns(&meta),
+        digest: *digest,
+    };
     if let Ok(bytes) = serde_json::to_vec(&memo) {
         let _ = write_atomic(&memo_path, &bytes, 0o644);
     }
 }
 
 fn memo_path(target_root: &Path, path: &Path) -> Result<PathBuf> {
-    let name = path.file_name().with_context(|| format!("{} has no file name", path.display()))?;
+    let name = path
+        .file_name()
+        .with_context(|| format!("{} has no file name", path.display()))?;
     Ok(target_root.join("blitz").join("digests").join(name))
 }
 
@@ -730,7 +780,10 @@ fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
 fn unique() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.subsec_nanos() as u64).unwrap_or(0);
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
     (nanos << 16) ^ N.fetch_add(1, Ordering::Relaxed)
 }
 
