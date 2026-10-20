@@ -8,6 +8,7 @@
 
 mod cli;
 mod hash;
+mod inputs;
 mod store;
 mod toolchain;
 mod whole;
