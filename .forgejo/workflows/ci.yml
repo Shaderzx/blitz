@@ -32,6 +32,7 @@ jobs:
           name="blitz-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           docker create --name "$name" -w /src rust:1-bookworm sh -ec '
             set -e
+            rustup component add rustfmt clippy
             cargo fmt --check
             cargo clippy --all-targets --locked -- -D warnings
             cargo build --release --locked

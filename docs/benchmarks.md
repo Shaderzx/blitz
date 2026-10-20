@@ -55,30 +55,41 @@ filesystem, and disk cache state.
 
 | field | value |
 | --- | --- |
-| date | TBD |
-| machine | TBD |
-| CPU / memory | TBD |
-| OS / filesystem | TBD |
-| rustc | TBD |
-| blitz commit | TBD |
-| repository and commit | TBD |
+| date | 2026-10-20 23:49 UTC |
+| machine | MacBook Pro, Apple M5 Pro |
+| CPU / memory | 18 cores, 64 GB |
+| OS / filesystem | macOS 27.0.1, APFS |
+| rustc | rustc 1.99.0 (b940084d7 2026-09-28) |
+| blitz commit | 73fa48c (PR #1) |
+| repository and commit | flowmaster/engine 548176ad, debug profile, `--locked` |
+
+The machine was not idle: other agents were running Docker stacks and builds, load average
+around 10 to 12 during the run. Both tools ran under the same load.
 
 ## Results
 
-Numbers are filled in from a real run on the machine above. This section is structure
-until then.
+Raw runs: [`bench/results-engine-2026-10-21.json`](../bench/results-engine-2026-10-21.json).
 
 | scenario | median seconds | speedup vs cargo cold | speedup vs cargo no-op |
 | --- | --- | --- | --- |
-| cargo cold | TBD | 1.00x | |
-| blitz cold | TBD | TBD | |
-| blitz warm | TBD | TBD | |
-| blitz warm + edit | TBD | TBD | |
-| cargo no-op | TBD | TBD | 1.00x |
-| blitz no-op | TBD | TBD | TBD |
+| cargo cold | 35.238 | 1.00x | |
+| blitz cold | 35.405 | 1.00x (0.5% slower) | |
+| blitz warm | 0.011 | **3,168x** | |
+| blitz warm + edit | 26.733 | 1.32x | |
+| cargo no-op | 0.123 | | 1.00x |
+| blitz no-op | 0.006 | | 20.5x |
 
-Binary check: after `blitz warm`, the restored binary must be executable and the same
-size class as the one cargo produced (within 25%). TBD.
+Binary check: the restored binary is executable and 102.78 MB against cargo's 102.79 MB
+(same size class; the bytes differ only in embedded checkout paths).
+
+What this says, plainly:
+- **Headline (target 144x): met, 3,168x.** A fresh checkout with an empty target directory
+  and a warm cache gets a runnable `engine` binary in 11 ms instead of 35 s.
+- The miss path costs 0.5% over plain cargo (target: under 5%).
+- After editing the top crate, the build is 1.32x faster: the dependencies are restored, but
+  engine is one large crate and compiling it is most of the build. blitz cannot make rustc
+  faster.
+- With nothing to do, blitz answers in 6 ms where cargo takes 123 ms.
 
 ## Reading the numbers
 

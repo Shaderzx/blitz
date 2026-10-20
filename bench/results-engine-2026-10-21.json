@@ -1,0 +1,94 @@
+{
+  "repo": "/private/tmp/blitz-bench/engine-a",
+  "commit": "548176ad49dccd2741659abbd909ae701d251dc0",
+  "blitz": "/private/tmp/blitz/repo/target/release/blitz",
+  "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "runs": 3,
+  "started_at": "2026-10-20T23:49:10Z",
+  "scenarios": {
+    "cargo cold": {
+      "median_seconds": 35.238,
+      "runs_seconds": [
+        35.238,
+        35.434,
+        34.939
+      ]
+    },
+    "blitz cold": {
+      "median_seconds": 35.405,
+      "runs_seconds": [
+        35.405,
+        38.063,
+        35.331
+      ]
+    },
+    "blitz warm": {
+      "median_seconds": 0.011,
+      "runs_seconds": [
+        0.013,
+        0.011,
+        0.011,
+        0.01,
+        0.011,
+        0.013,
+        0.011,
+        0.012,
+        0.011,
+        0.012
+      ]
+    },
+    "blitz warm + edit": {
+      "median_seconds": 26.733,
+      "runs_seconds": [
+        26.525,
+        26.733,
+        28.459
+      ],
+      "edited_file": "src/main.rs"
+    },
+    "cargo no-op": {
+      "median_seconds": 0.123,
+      "runs_seconds": [
+        0.128,
+        0.113,
+        0.114,
+        0.121,
+        0.148,
+        0.129,
+        0.128,
+        0.124,
+        0.116,
+        0.113
+      ]
+    },
+    "blitz no-op": {
+      "median_seconds": 0.006,
+      "runs_seconds": [
+        0.006,
+        0.006,
+        0.006,
+        0.006,
+        0.006,
+        0.005,
+        0.006,
+        0.006,
+        0.006,
+        0.006
+      ]
+    }
+  },
+  "binary": {
+    "cargo": {
+      "name": "engine",
+      "profile": "debug",
+      "size": 102787112
+    },
+    "blitz": {
+      "name": "engine",
+      "profile": "debug",
+      "size": 102775304
+    },
+    "size_ratio": 1.0,
+    "same_size_class": true
+  }
+}
