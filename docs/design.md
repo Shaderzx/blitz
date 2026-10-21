@@ -303,14 +303,16 @@ behind a workspace wrapper such as `clippy-driver`, takes this path:
 3. **Snapshot** after the compiler exits 0: every `<crate_name>-*` directory and its newest finalized
    `s-*` session (not `-working`) were recorded before the compile, so the one directory whose
    session changed during it is the crate directory this invocation wrote; that newest session's
-   files plus its lock are stored. Two directories changing at once cannot be attributed, so the
-   snapshot is skipped (`nosnap ambiguous`). The blobs are written from the digest
-   memo, so unchanged object files are not re-hashed. A lineage snapshotted less than five minutes
-   ago is left alone unless `BLITZ_INCREMENTAL_SNAPSHOT=always`, which adopting CI sets (the
-   FlowMaster repos do), so every run leaves the newest state for the next pull request. Log the file
-   count, byte count and duration, and log `nosnap <reason>` when a snapshot is skipped. Staging
-   directories a killed build left behind (`.blitz-seed-*` older than an hour) are deleted when the
-   next seed runs.
+   files plus its lock are stored. Under concurrent lib and test compiles the newest changed session
+   can belong to the sibling instead: that only costs a seed, because rustc discards a session whose
+   command line differs, and it never produces wrong output. Two sessions with one timestamp cannot
+   be attributed at all, so the snapshot is skipped (`nosnap ambiguous`). The blobs are written
+   from the digest memo, so unchanged object files are not re-hashed. A lineage snapshotted less
+   than five minutes ago is left alone unless `BLITZ_INCREMENTAL_SNAPSHOT=always`, which adopting CI
+   sets (the FlowMaster repos do), so every run leaves the newest state for the next pull request.
+   Log the file count, byte count and duration, and log `nosnap <reason>` when a snapshot is
+   skipped. Staging directories a killed build left behind (`.blitz-seed-*` older than an hour) are
+   deleted when the next seed runs.
 4. `BLITZ_INCREMENTAL=off` disables seeding and snapshots.
 
 ## Correctness rules

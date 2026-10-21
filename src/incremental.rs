@@ -264,10 +264,12 @@ impl Plan {
             return Ok(None);
         }
         // The compiler that finished most recently wrote the newest session, and this invocation is
-        // the one that just exited: several targets of one crate compile together (a library and its
-        // test build share the incremental directory), so the newest is ours. Two sessions with the
-        // same timestamp cannot be told apart, and guessing would hand another target's state to
-        // this lineage.
+        // the one that just exited. A library and its test build share an incremental directory and
+        // compile together, so under concurrent compiles the newest changed session can belong to the
+        // sibling rather than to this invocation. That costs a seed and nothing else: rustc discards a
+        // session whose command line differs, so it recompiles from scratch and never reuses foreign
+        // state. Two sessions with the same timestamp cannot be told apart at all, and picking one
+        // blind could hand this lineage the other's state, so that case stores nothing.
         changed.sort_by(|a, b| session_time(b).cmp(&session_time(a)));
         if changed.len() > 1 && session_time(&changed[0]) == session_time(&changed[1]) {
             wrapper::log_decision("nosnap", &self.krate, "ambiguous");
