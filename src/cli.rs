@@ -24,6 +24,8 @@ ENVIRONMENT:
     BLITZ_VERIFY=1    re-hash every restored blob and drop the ones that do not match
     BLITZ_DISABLE=1   run plain cargo, no caching
     BLITZ_LOG=<file>  append a line per cache decision to <file>
+    BLITZ_INCREMENTAL=off             do not seed or snapshot incremental state
+    BLITZ_INCREMENTAL_SNAPSHOT=always snapshot on every compile instead of every five minutes
 ";
 
 pub fn main(args: &[OsString]) -> i32 {

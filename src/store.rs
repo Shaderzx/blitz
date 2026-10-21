@@ -78,6 +78,21 @@ impl Store {
         Ok(d)
     }
 
+    /// Stores a copy of `src` as the blob named by `d`, which the caller already computed (and
+    /// usually memoized). Never re-hashes, so an unchanged object file costs one copy.
+    pub fn put_file_with(&self, src: &Path, d: &Digest) -> Result<()> {
+        let Some(root) = self.writable_root() else {
+            return Ok(());
+        };
+        let dest = blob_path(root, d);
+        if dest.exists() {
+            return Ok(());
+        }
+        let tmp = staging_path(root)?;
+        fs::copy(src, &tmp).with_context(|| format!("copying {} into the cache", src.display()))?;
+        publish(&tmp, &dest)
+    }
+
     pub fn put_bytes(&self, data: &[u8]) -> Result<Digest> {
         let d = Digest::of_bytes(data);
         if let Some(root) = self.writable_root() {

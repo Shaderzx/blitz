@@ -112,27 +112,27 @@ const SUBCOMMANDS: &[&str] = &[
 /// chain behaves exactly as it would without blitz in the middle.
 pub fn chained(args: &[OsString]) -> Option<i32> {
     let first = args.first()?;
-    if first.to_str().is_some_and(|f| SUBCOMMANDS.contains(&f)) || looks_like_compiler(first) {
+    if first.to_str().is_some_and(|f| SUBCOMMANDS.contains(&f)) {
         return None;
     }
-    // Cargo passes the real compiler path directly behind the wrapper, including for the
-    // `rustc -vV` probe it runs before any crate has a name, so this check must not depend on
-    // `CARGO_PKG_NAME`. Outside cargo a command that happens to sit in front of a compiler is
-    // still only treated as a wrapper when it exists as a program.
+    // Cargo passes the real compiler path directly behind the wrapper. When the wrapper is itself
+    // a compiler driver (`clippy-driver`), that second argument is the only thing that tells a
+    // chained invocation apart from `blitz <compiler> <args>`.
     if !args.get(1).is_some_and(|a| looks_like_compiler(a)) {
         return None;
     }
     if std::env::var_os("CARGO_PKG_NAME").is_none() && find_program(Path::new(first)).is_none() {
         return None;
     }
-    let code = match Command::new(first).args(&args[1..]).status() {
-        Ok(status) => status.code().unwrap_or(1),
-        Err(e) => {
-            eprintln!("blitz: cannot run {}: {e}", Path::new(first).display());
-            1
-        }
-    };
-    Some(code)
+    // A chained incremental invocation is seeded and snapshotted like a direct one: cargo put this
+    // driver in front of the compiler, and the crate behind it is the same crate either way.
+    let real = &args[1];
+    let rest = &args[2..];
+    let inv = parse(rest);
+    if inv.incremental && inv.incremental_dir.is_some() {
+        return Some(crate::incremental::run(real, Some(first), rest, &inv));
+    }
+    Some(run_program(first, &args[1..]))
 }
 
 pub fn main(rustc: &OsStr, args: &[OsString]) -> i32 {
@@ -152,10 +152,15 @@ pub fn main(rustc: &OsStr, args: &[OsString]) -> i32 {
 
 /// Runs the real compiler with the original arguments, inheriting stdio.
 pub fn passthrough(rustc: &OsStr, args: &[OsString]) -> i32 {
-    match Command::new(rustc).args(args).status() {
+    run_program(rustc, args)
+}
+
+/// Runs `program` with `args`, inheriting stdio, and returns its exit code (1 when it cannot start).
+pub(crate) fn run_program(program: &OsStr, args: &[OsString]) -> i32 {
+    match Command::new(program).args(args).status() {
         Ok(s) => s.code().unwrap_or(1),
         Err(e) => {
-            eprintln!("blitz: cannot run {}: {e}", Path::new(rustc).display());
+            eprintln!("blitz: cannot run {}: {e}", Path::new(program).display());
             1
         }
     }
@@ -182,9 +187,20 @@ fn run(rustc: &OsStr, args: &[OsString]) -> Result<Outcome> {
         return Ok(Outcome::Pass("stdin-input"));
     }
     if inv.incremental {
+        if inv.incremental_dir.is_some() {
+            // Seeding and snapshotting happen around the compiler, which still runs every time.
+            return Ok(Outcome::Done(crate::incremental::run(rustc, None, args, &inv)));
+        }
         return Ok(Outcome::Pass("incremental"));
     }
-    if inv.crate_types.is_empty() || !inv.crate_types.iter().all(|t| CACHEABLE_TYPES.contains(&t.as_str())) {
+    // A build script is the one `bin` unit whose output is a function of its sources and the
+    // linker: cargo names it `build_script_*` and never links anything of the user's into it.
+    let build_script = krate.starts_with("build_script_");
+    let cacheable = inv
+        .crate_types
+        .iter()
+        .all(|t| CACHEABLE_TYPES.contains(&t.as_str()) || (build_script && t == "bin"));
+    if inv.crate_types.is_empty() || !cacheable {
         return Ok(Outcome::Pass("crate-type"));
     }
     if !inv.emit.is_empty() && !inv.emit.iter().any(|e| e == "link" || e == "metadata") {
@@ -213,6 +229,7 @@ fn run(rustc: &OsStr, args: &[OsString]) -> Result<Outcome> {
         extra_filename: &inv.extra_filename,
         manifest: manifest.as_deref(),
         registry,
+        build_script,
     };
 
     let Some(key) = ctx.key(rustc, args, &inv)? else {
@@ -241,6 +258,8 @@ struct Ctx<'a> {
     /// True for an unpacked registry crate, whose sources and environment reads are keyed without a
     /// pre-pass (see `Ctx::sources`).
     registry: bool,
+    /// True for a build script, whose executable is keyed and restored like a proc-macro.
+    build_script: bool,
 }
 
 impl Ctx<'_> {
@@ -273,9 +292,10 @@ impl Ctx<'_> {
         if self.sources(&mut k, rustc, args)?.is_none() {
             return Ok(None);
         }
-        if inv.crate_types.iter().any(|t| t == "proc-macro") {
+        if inv.crate_types.iter().any(|t| t == "proc-macro") || self.build_script {
             // A proc-macro is a linked artifact, and rustc records neither the linker nor the SDK it
-            // was given. An unresolvable linker means we cannot tell what produced the bytes.
+            // was given. An unresolvable linker means we cannot tell what produced the bytes. A
+            // build script is the same kind of artifact.
             match linker_identity(inv.linker.as_deref()) {
                 Some(d) => k.digest("linker", &d),
                 None => return Ok(None),
@@ -454,6 +474,13 @@ impl Ctx<'_> {
                 continue;
             }
             let path = self.out_dir.join(&name);
+            // A build script's executable is linked, so it is stored and restored executable; every
+            // other output is a plain file.
+            let mode = if self.build_script && !is_dep_info(&name) {
+                0o755
+            } else {
+                0o644
+            };
             // The stored `.d` carries placeholders, but the memo has to describe the bytes that are
             // on disk, or a later lookup reuses a digest for text that was never written.
             let (digest, on_disk) = if is_dep_info(&name) {
@@ -469,11 +496,7 @@ impl Ctx<'_> {
                 (stored, stored)
             };
             remember_digest(self.target_root, &path, &on_disk);
-            outputs.push(UnitOutput {
-                name,
-                digest,
-                mode: 0o644,
-            });
+            outputs.push(UnitOutput { name, digest, mode });
         }
         if skipped {
             // This unit normally writes a file that this compile left untouched: storing the rest
@@ -512,24 +535,35 @@ impl Ctx<'_> {
 
     fn output_prefixes(&self) -> Vec<String> {
         let name = self.krate.replace('-', "_");
-        vec![
+        let mut prefixes = vec![
             format!("lib{name}{}.", self.extra_filename),
             format!("{name}{}.", self.extra_filename),
-        ]
+        ];
+        if self.build_script {
+            // A build script is a bin unit: the executable has no extension and rustc names it with
+            // the crate name plus `-C extra-filename`, so the prefix has no trailing dot.
+            prefixes.push(format!("{name}{}", self.extra_filename));
+        }
+        prefixes
     }
 }
 
 #[derive(Default)]
-struct Invocation {
-    crate_name: Option<String>,
-    out_dir: Option<PathBuf>,
-    extra_filename: String,
-    linker: Option<String>,
-    emit: Vec<String>,
-    crate_types: Vec<String>,
-    incremental: bool,
-    externs: Vec<(String, String)>,
-    inputs: Vec<String>,
+pub(crate) struct Invocation {
+    pub(crate) crate_name: Option<String>,
+    pub(crate) out_dir: Option<PathBuf>,
+    pub(crate) extra_filename: String,
+    pub(crate) linker: Option<String>,
+    pub(crate) emit: Vec<String>,
+    pub(crate) crate_types: Vec<String>,
+    /// True for both `-C incremental` forms, which keep the unit out of the per-unit cache.
+    pub(crate) incremental: bool,
+    /// The `-C incremental=<dir>` value, when the build named one.
+    pub(crate) incremental_dir: Option<PathBuf>,
+    pub(crate) test: bool,
+    pub(crate) target: Option<String>,
+    pub(crate) externs: Vec<(String, String)>,
+    pub(crate) inputs: Vec<String>,
 }
 
 fn parse(args: &[OsString]) -> Invocation {
@@ -540,6 +574,10 @@ fn parse(args: &[OsString]) -> Invocation {
         i += 1;
         if raw == "-" || !raw.starts_with('-') {
             inv.inputs.push(raw);
+            continue;
+        }
+        if raw == "--test" {
+            inv.test = true;
             continue;
         }
         let (flag, inline) = split_flag(&raw);
@@ -560,6 +598,7 @@ fn parse(args: &[OsString]) -> Invocation {
             "--crate-type" => inv.crate_types.extend(value.split(',').map(str::to_string)),
             "--out-dir" => inv.out_dir = Some(PathBuf::from(value)),
             "--emit" => inv.emit.extend(value.split(',').map(str::to_string)),
+            "--target" => inv.target = Some(value),
             "--extern" => {
                 if let Some((name, path)) = value.split_once('=') {
                     inv.externs.push((name.to_string(), path.to_string()));
@@ -572,8 +611,11 @@ fn parse(args: &[OsString]) -> Invocation {
                 if let Some(rest) = value.strip_prefix("linker=") {
                     inv.linker = Some(rest.to_string());
                 }
-                if value == "incremental" || value.starts_with("incremental=") {
+                if value == "incremental" {
                     inv.incremental = true;
+                } else if let Some(rest) = value.strip_prefix("incremental=") {
+                    inv.incremental = true;
+                    inv.incremental_dir = Some(PathBuf::from(rest));
                 }
             }
             _ => {}
@@ -603,9 +645,22 @@ fn plain_rustc(rustc: &OsStr) -> bool {
     Path::new(rustc).file_stem().is_some_and(|s| s == OsStr::new("rustc"))
 }
 
-fn target_root_of(out_dir: &Path) -> Option<PathBuf> {
+pub(crate) fn target_root_of(out_dir: &Path) -> Option<PathBuf> {
     if out_dir.file_name().is_some_and(|f| f == "deps") {
         out_dir.parent().and_then(Path::parent).map(Path::to_path_buf)
+    } else if out_dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .is_some_and(|f| f == "build")
+    {
+        // A build script's `--out-dir` is `<target>/<profile>/build/<pkg>-<hash>`, and its compile
+        // line still names `<target>/<profile>/deps`. The target root is the directory that makes
+        // those paths normalizable, so `-L` and `--extern` arguments do not keep a checkout path.
+        out_dir
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
     } else {
         Some(out_dir.to_path_buf())
     }
@@ -620,7 +675,7 @@ fn cargo_home() -> Option<PathBuf> {
         .map(|h| PathBuf::from(h).join(".cargo"))
 }
 
-fn build_normalizer(target_root: &Path) -> Normalizer {
+pub(crate) fn build_normalizer(target_root: &Path) -> Normalizer {
     let mut n = Normalizer::new();
     n.add(target_root, normalize::TARGET);
     if let Ok(cwd) = std::env::current_dir() {
@@ -670,7 +725,7 @@ fn linker_identity(linker: Option<&str>) -> Option<Digest> {
     Some(k.finish())
 }
 
-fn find_program(name: &Path) -> Option<PathBuf> {
+pub(crate) fn find_program(name: &Path) -> Option<PathBuf> {
     if name.components().count() > 1 {
         return name.is_file().then(|| name.to_path_buf());
     }
@@ -853,7 +908,7 @@ const RACY: Duration = Duration::from_secs(2);
 
 /// Digest of `path`, memoized in the target directory by size, mtime and inode, so each rlib is
 /// hashed once per build instead of once per dependent crate.
-fn file_digest(target_root: &Path, path: &Path) -> Result<Digest> {
+pub(crate) fn file_digest(target_root: &Path, path: &Path) -> Result<Digest> {
     let meta = fs::metadata(path)?;
     let len = meta.len();
     let mtime = mtime_ns(&meta);
@@ -1036,7 +1091,7 @@ fn unique() -> u64 {
 }
 
 /// One line per decision in `$BLITZ_LOG`: `hit|miss|pass <crate> <reason>`.
-fn log_decision(kind: &str, krate: &str, reason: &str) {
+pub(crate) fn log_decision(kind: &str, krate: &str, reason: &str) {
     let Some(path) = std::env::var_os("BLITZ_LOG") else {
         return;
     };

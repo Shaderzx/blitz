@@ -95,6 +95,50 @@ What this says, plainly:
 - Earlier runs on the same machine: 73fa48c gave 11 ms warm (3,168x) and +0.5% cold; 8d86eb1
   gave 11 ms warm and +9.8% cold (the regression above).
 
+## v0.2: incremental seeding and cached build scripts (2026-10-21)
+
+Same machine and repository (flowmaster/engine `ae28b873`, debug profile, `--locked`), one
+`bench/bench.py --runs 1` run per binary. The runs are minutes apart on a shared machine, so
+compare each row with `cargo cold` from its own table as well as the absolute seconds.
+
+`blitz` before (main `c64f851`, v0.1):
+
+| scenario | median seconds | speedup vs cargo cold | speedup vs cargo no-op |
+| --- | --- | --- | --- |
+| cargo cold | 33.049 | 1.00x | |
+| blitz cold | 33.296 | 0.99x | |
+| blitz warm | 0.011 | 2914.46x | |
+| blitz warm + edit | 28.523 | 1.16x | |
+| cargo no-op | 0.112 | | 1.00x |
+| blitz no-op | 0.011 | | 10.22x |
+
+`blitz` after (v0.2):
+
+| scenario | median seconds | speedup vs cargo cold | speedup vs cargo no-op |
+| --- | --- | --- | --- |
+| cargo cold | 35.116 | 1.00x | |
+| blitz cold | 36.379 | 0.97x | |
+| blitz warm | 0.011 | 3113.96x | |
+| blitz warm + edit | 24.604 | 1.43x | |
+| cargo no-op | 0.114 | | 1.00x |
+| blitz no-op | 0.011 | | 9.92x |
+
+`blitz warm + edit` fell from 28.523 s to 24.604 s, and from 86% of that run's cold build to
+70%. The gain is bounded by rustc: it discards an incremental session whose command line
+differs, and a fresh checkout spells `--out-dir`, `-L` and the source paths differently, so
+little of another checkout's session is reused. Seeding the same tree is where the feature
+pays: on a checkout that had built once, deleting the incremental state and editing one
+library line rebuilt in 17.0 s without seeding and 2.3 s with a snapshot taken from that
+same compiled state.
+
+Build scripts: on a fresh checkout of the same revision, 313 of 318 units came from the cache
+(35 build-script units used to miss every time). The snapshot cost measured during that
+debug build was 261 files / 314.2 MB in 249 ms for the library lineage and 218 files / 54.1 MB
+in 100 ms for the binary lineage, about 0.8% of a 44 s cold build.
+
+Raw runs: [`bench/results-engine-2026-10-21-v0.2-before.json`](../bench/results-engine-2026-10-21-v0.2-before.json)
+and [`bench/results-engine-2026-10-21-v0.2-after.json`](../bench/results-engine-2026-10-21-v0.2-after.json).
+
 ## Reading the numbers
 
 - Compare `blitz cold` against `cargo cold` first. A miss path that is much slower than
