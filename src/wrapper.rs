@@ -419,8 +419,8 @@ impl Ctx<'_> {
                 write_atomic(&dest, &bytes, output.mode)?;
                 // The memo has to describe the bytes on disk, which are not the stored text.
                 Digest::of_bytes(&bytes)
-            } else if self.build_script && self.registry {
-                // Every other output of a build-script unit is the real executable. The entry names it
+            } else if self.build_script && self.registry && output.name == self.executable_name() {
+                // Only the executable belongs next to the shim. The entry names it
                 // under the plain crate name, the name v0.2 used, but the bytes go next to the shim and
                 // the shim itself is written fresh because it names this blitz.
                 let exe = self.out_dir.join(self.executable_name());
@@ -516,7 +516,7 @@ impl Ctx<'_> {
             let path = self.out_dir.join(&name);
             // A build script's executable is linked, so it is stored and restored executable; every
             // other output is a plain file.
-            let mode = if self.build_script && !is_dep_info(&name) {
+            let mode = if self.build_script && stored_name == exe_name {
                 0o755
             } else {
                 0o644

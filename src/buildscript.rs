@@ -293,6 +293,7 @@ impl Ctx {
             // Undo a half-written restore so the real script starts from the empty directory cargo
             // gave it.
             let _ = fs::remove_dir_all(&self.out_dir);
+            let _ = fs::create_dir_all(&self.out_dir);
             self.log("bsrun-miss", &format!("restore-error: {e:#}"));
             return Ok(None);
         }
@@ -321,7 +322,7 @@ impl Ctx {
     }
 
     /// A directory has no blob, and a symlink's digest describes the file it resolved to, which is
-    /// not restored with it: `restore_link` reads that file through the link on every lookup. Only a
+    /// not restored with it: `restore` reads that file through the link on every lookup. Only a
     /// regular file entry needs its bytes here, or a link that points outside OUT_DIR misses forever.
     fn blobs_present(&self, entry: &BsEntry) -> bool {
         entry
@@ -341,7 +342,7 @@ impl Ctx {
 
     fn restore(&self, entry: &BsEntry) -> Result<()> {
         fs::create_dir_all(&self.out_dir)?;
-        for file in &entry.files {
+        for file in entry.files.iter().filter(|f| f.link.is_none()) {
             let dest = self.out_dir.join(&file.name);
             if file.dir {
                 fs::create_dir_all(&dest)?;
@@ -350,11 +351,18 @@ impl Ctx {
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent)?;
             }
-            if file.link.is_some() {
-                self.restore_link(file, &dest)?;
-            } else {
-                let digest = file.digest.as_ref().context("a file entry has no digest")?;
-                self.store.materialize(digest, &dest, file.mode)?;
+            let digest = file.digest.as_ref().context("a file entry has no digest")?;
+            self.store.materialize(digest, &dest, file.mode)?;
+        }
+        for file in entry.files.iter().filter(|f| f.link.is_some()) {
+            self.restore_link(file, &self.out_dir.join(&file.name))?;
+        }
+        // A link may name another link that sorts later. Validate only after every target exists.
+        for file in entry.files.iter().filter(|f| f.link.is_some()) {
+            if let Some(recorded) = &file.digest
+                && Digest::of_file(&self.out_dir.join(&file.name))? != *recorded
+            {
+                bail!("symlink target changed");
             }
         }
         Ok(())
@@ -370,13 +378,6 @@ impl Ctx {
         std::os::unix::fs::symlink(target, dest)?;
         #[cfg(not(unix))]
         bail!("symlinks in OUT_DIR are not supported on this platform");
-        // The link was recorded with the digest of what it resolved to, and that target is not
-        // restored with it: a hit is only honest when the target still holds the same bytes.
-        if let Some(recorded) = &file.digest
-            && Digest::of_file(dest)? != *recorded
-        {
-            bail!("symlink target changed");
-        }
         Ok(())
     }
 
@@ -511,6 +512,8 @@ impl Ctx {
     /// The `cargo:rerun-if-*` requests the script printed, with what they say today. A request the
     /// key already covers (anything inside the crate, anything in OUT_DIR) is left out.
     fn watched(&self, stdout: &str) -> Result<Watched> {
+        let manifest_root = fs::canonicalize(&self.manifest)?;
+        let out_root = fs::canonicalize(&self.out_dir)?;
         let mut env_deps = Vec::new();
         let mut paths = Vec::new();
         for line in stdout.lines() {
@@ -525,9 +528,11 @@ impl Ctx {
                 } else {
                     self.manifest.join(path)
                 };
-                if path.starts_with(&self.manifest) || path.starts_with(&self.out_dir) {
-                    // Inside the crate: the script's own bytes cover the source tree. Inside OUT_DIR:
-                    // the tree is restored with it.
+                if fs::canonicalize(&path)
+                    .is_ok_and(|resolved| resolved.starts_with(&manifest_root) || resolved.starts_with(&out_root))
+                {
+                    // Resolve before checking containment. A lexical `..` path can name an external
+                    // input, and an unresolved path still needs its original spelling watched.
                     continue;
                 }
                 let digest = match fs::metadata(&path) {

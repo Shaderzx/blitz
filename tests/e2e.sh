@@ -277,6 +277,10 @@ fn main() {
     fs::write(format!("{out}/value.txt"), "build-script-value").expect("write the build script output");
     // An empty directory has no file to carry it back from the cache.
     fs::create_dir(format!("{out}/emptydir")).expect("create the empty directory");
+    std::os::unix::fs::symlink("blink", format!("{out}/alink")).unwrap();
+    std::os::unix::fs::symlink("value.txt", format!("{out}/blink")).unwrap();
+    let external = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("outside");
+    std::os::unix::fs::symlink(external, format!("{out}/zoutside")).unwrap();
 }
 EOF
 cat >"$bsrun_dep/src/lib.rs" <<'EOF'
@@ -304,9 +308,12 @@ EOF
 # The path dependency is a local package, so cargo would compile the build script with `-C
 # incremental` and the per-unit cache (which installs the shim) would not see it. Registry crates in
 # a real build are not incremental; turn it off so this check exercises that path.
-( cd "$bsrun" && CARGO_HOME=$bsrun_home CARGO_INCREMENTAL=0 BLITZ_CACHE_DIR=$work/bsrun-cache \
-  RUSTC_WRAPPER=$blitz cargo build --offline ) >/dev/null 2>&1 \
-  || fail "the first registry build-script build failed"
+printf one >"$bsrun_dep/../outside"
+bsrun_build() {
+  ( cd "$bsrun" && CARGO_HOME=$bsrun_home CARGO_INCREMENTAL=0 BLITZ_CACHE_DIR=$work/bsrun-cache \
+    BLITZ_LOG=$bsrun_log RUSTC_WRAPPER=$blitz cargo build --offline "$@" 2>&1 )
+}
+out=$(bsrun_build) || fail "the first registry build-script build failed: $out"
 first_value=$("$bsrun/target/debug/app") || fail "the registry build-script binary did not run"
 [ "$first_value" = "build-script-value" ] \
   || fail "the clean build printed '$first_value', expected 'build-script-value'"
@@ -317,9 +324,7 @@ shim=$(find "$bsrun/target/debug/build" -name 'build_script_*' ! -name '*.d' ! -
 [ -x "$shim.blitz-real" ] || fail "the real build script was not kept next to the shim"
 rm -rf "$bsrun/target"
 : >"$bsrun_log"
-( cd "$bsrun" && CARGO_HOME=$bsrun_home CARGO_INCREMENTAL=0 BLITZ_CACHE_DIR=$work/bsrun-cache \
-  BLITZ_LOG=$bsrun_log RUSTC_WRAPPER=$blitz cargo build --offline ) >/dev/null 2>&1 \
-  || fail "the second registry build-script build failed"
+out=$(bsrun_build) || fail "the second registry build-script build failed: $out"
 grep -qE '^bsrun-hit[[:space:]]' "$bsrun_log" \
   || fail "no bsrun-hit line in BLITZ_LOG: $(tr '\n' ' ' <"$bsrun_log")"
 find "$bsrun/target/debug/build" -type d -name emptydir | grep -q . \
@@ -327,7 +332,31 @@ find "$bsrun/target/debug/build" -type d -name emptydir | grep -q . \
 second_value=$("$bsrun/target/debug/app") || fail "the restored registry build-script binary did not run"
 [ "$second_value" = "$first_value" ] \
   || fail "the restored build printed '$second_value', expected '$first_value'"
-ok "a registry build script is shimmed and its run is restored after a deleted target"
+ok "a registry build script restores its files, empty directory and forward symlink chain"
+printf two >"$bsrun_dep/../outside"
+rm -rf "$bsrun/target"
+: >"$bsrun_log"
+out=$(bsrun_build) || fail "the build after a symlink target changed failed: $out"
+grep -q "restore-error: symlink target changed" "$bsrun_log" || fail "no symlink digest failure"
+expect_output "$bsrun" debug build-script-value "the fallback after a failed restore"
+ok "a failed restore recreates empty OUT_DIR before running the real build script"
+rm -rf "$bsrun/target"
+( cd "$bsrun" && CARGO_HOME=$bsrun_home CARGO_INCREMENTAL=0 cargo build --offline ) >/dev/null 2>&1 || fail "plain cargo"
+expect_output "$bsrun" debug build-script-value "plain cargo control"
+ok "plain Cargo also passes the external symlink fixture"
+if [ "$(uname -s)" = Darwin ]; then
+  for attempt in 1 2; do
+    rm -rf "$bsrun/target"
+    : >"$bsrun_log"
+    out=$(RUSTFLAGS="-C split-debuginfo=unpacked" bsrun_build --target aarch64-apple-darwin) \
+      || fail "split-debuginfo build $attempt failed: $out"
+    [ "$("$bsrun/target/aarch64-apple-darwin/debug/app")" = build-script-value ] || fail "split-debuginfo output"
+  done
+  grep -qE '^hit[[:space:]]+build_script_build' "$bsrun_log" || fail "no split-debuginfo unit hit"
+  object=$(find "$bsrun/target/debug/build" -name '*.rcgu.o' | head -1)
+  [ -n "$object" ] && [ ! -x "$object" ] || fail "restored object missing or executable"
+  ok "split-debuginfo object files restore without overwriting the build script"
+fi
 
 # 13. A modern build script prints the double-colon spellings cargo accepts since 1.77:
 #     `cargo::rerun-if-env-changed` and `cargo::rustc-env`, with a trailing space on the name because
@@ -351,7 +380,11 @@ cat >"$probe_dep/build.rs" <<'EOF'
 fn main() {
     println!("cargo::rerun-if-env-changed=BLITZ_PROBE ");
     let value = std::env::var("BLITZ_PROBE").unwrap_or_default();
-    println!("cargo::rustc-env=BLITZ_PROBE={value}");
+    println!("cargo::rerun-if-changed=../shared/x");
+    println!("cargo::rerun-if-changed=watch-link");
+    let watched = std::fs::read_to_string("../shared/x").unwrap();
+    let linked = std::fs::read_to_string("watch-link").unwrap();
+    println!("cargo::rustc-env=BLITZ_PROBE={value}:{watched}:{linked}");
 }
 EOF
 cat >"$probe_dep/src/lib.rs" <<'EOF'
@@ -380,17 +413,33 @@ probe_build() {
   ( cd "$probe" && CARGO_HOME=$probe_home CARGO_INCREMENTAL=0 BLITZ_CACHE_DIR=$work/probe-cache \
     BLITZ_LOG=$probe_log RUSTC_WRAPPER=$blitz BLITZ_PROBE=$1 cargo build --offline ) >/dev/null 2>&1
 }
+mkdir -p "$probe_dep/../shared"
+printf one >"$probe_dep/../shared/x"
+printf linked >"$probe_dep/../shared/y"
+ln -s ../shared/y "$probe_dep/watch-link"
 : >"$probe_log"
 probe_build a || fail "the first double-colon build-script build failed"
 value=$("$probe/target/debug/app") || fail "the first double-colon build-script binary did not run"
-[ "$value" = "a" ] || fail "the first double-colon build printed '$value', expected 'a'"
+[ "$value" = "a:one:linked" ] || fail "the first double-colon build printed '$value', expected 'a:one:linked'"
 rm -rf "$probe/target"
 : >"$probe_log"
 probe_build b || fail "the second double-colon build-script build failed"
 grep -qE '^bsrun-miss[[:space:]].*env-changed' "$probe_log" \
   || fail "no bsrun-miss env-changed line in BLITZ_LOG: $(tr '\n' ' ' <"$probe_log")"
 value=$("$probe/target/debug/app") || fail "the rebuilt double-colon build-script binary did not run"
-[ "$value" = "b" ] || fail "the rebuilt double-colon build printed '$value', expected 'b'"
+[ "$value" = "b:one:linked" ] || fail "the rebuilt double-colon build printed '$value', expected 'b:one:linked'"
+printf two >"$probe_dep/../shared/x"
+rm -rf "$probe/target"
+probe_build b || fail "the build after changing ../shared/x failed"
+value=$("$probe/target/debug/app")
+[ "$value" = "b:two:linked" ] || fail "../shared/x change printed '$value', expected 'b:two:linked'"
+ok "a registry build script watches an external path containing .."
+ln -sf ../shared/x "$probe_dep/watch-link"
+rm -rf "$probe/target"
+probe_build b || fail "the build after retargeting watch-link failed"
+value=$("$probe/target/debug/app")
+[ "$value" = "b:two:two" ] || fail "watch-link change printed '$value', expected 'b:two:two'"
+ok "a symlink inside the registry extraction watches its external target and retargeting"
 ok "cargo:: rerun-if-env-changed is recorded and flipping the value misses and rebuilds"
 
 echo "all e2e checks passed"

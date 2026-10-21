@@ -205,20 +205,26 @@ crate that builds C in its build script that run dominates: on engine's CI build
    The paths are absolute and single-quoted. Cargo hard-links the executable to `build-script-build`
    after the compile returns, so whichever name it runs is the shim. The shim still works when blitz
    is gone (a CI run whose blitz download failed reuses the same target volume), and it falls back to
-   the real script only when blitz never started one. A non-zero exit alone does not say that: it is
-   also a script that failed, or blitz killed by the kernel, and running a script that already ran a
+   the real script when blitz exits non-zero without a marker. A non-zero exit alone also describes
+   a script that failed, or blitz killed by the kernel. Running a script that already ran a
    second time repeats its side effects and its output. blitz therefore touches
    `$BLITZ_BSRUN_MARK`, `<real>.blitz-mark.$$` beside the real binary, immediately before it starts
    the real script, whether or not the run is cached, and never removes it: the shim does. The marker
    lives in cargo's own writable build directory, so a `$TMPDIR` that cannot be written cannot cost
    the fallback its precision. A marker means the script is what produced the code, or is producing
-   it; no marker with a non-zero exit means nothing ran, so the shim execs the script. An exit of
-   zero removes the marker and exits 0. Path and workspace crates keep the plain executable,
-   because cargo recompiles their build script whenever their sources change and their runs are not
+   it. Without a marker after a non-zero exit, the shim assumes nothing ran and execs the script.
+   An exit of zero removes the marker and exits 0. If the shim itself is killed, its marker can remain under
+   target until cargo cleans it. A signal between writing the marker and spawning the real script
+   can suppress fallback even though the script has not started. The marker prevents duplicate runs
+   after spawn; it cannot make marking and spawning atomic. If writing the marker fails, a non-zero
+   exit can still cause a duplicate run. Path and workspace crates keep the plain executable, because
+   cargo recompiles their build script whenever their sources change and their runs are not
    the expensive ones. The per-unit entry stores the real binary (mode 0755) under the hashed
    executable name cargo gave the script (`build_script_build-<meta>`), the name it had before the
    shim replaced it and the name v0.2 stored, and never the shim; a restore writes the shim fresh, so
-   it names the blitz doing the restoring, and a v0.2 binary can still read a v0.3 entry.
+   it names the blitz doing the restoring, and a v0.2 binary can still read a v0.3 entry. Only that
+   executable uses the real path and mode 0755. Extra outputs, including split-debuginfo object files,
+   keep their own names and mode 0644.
 
 2. **Key** (domain `blitz-bsrun-v1`):
    - the BLAKE3 digest of the real executable (a recompile, a new compiler or a new linker changes it);
@@ -244,17 +250,20 @@ crate that builds C in its build script that run dominates: on engine's CI build
    resolves to a directory or a special file makes the run uncacheable rather than stale. Paths inside
    the crate are left out because the shim is only installed for an unpacked registry crate: its
    extraction is immutable and checksum-verified, so nothing inside it can change while the key stays
-   the same.
+   the same. Containment checks resolve existing paths and both roots first, so `..` and symlinks
+   cannot hide an external input. External watches retain their original path so retargeting a
+   symlink changes the bytes checked on lookup. An unresolved path is watched, not ignored.
 
 4. **Hit.** Only into an empty or missing `OUT_DIR`; anything already there belongs to this run, so the
    real script runs instead. Files are materialized with their recorded modes, directories are
    recreated from entries of their own (an empty one has no file to carry it), and symlinks are
    recreated with their targets: a link that resolves to a file is stored with the digest of that
    target and verified on every lookup, and a link to a directory or a special file makes the run
-   uncacheable. An entry with an absolute name or a `..` refuses the hit. Cargo parses
-   the recorded stdout, so it is replayed byte for byte, with the recorded stderr after it. A restore
-   that fails halfway removes `OUT_DIR` again, so the real script starts from the empty directory cargo
-   gave it.
+   uncacheable. Regular files and directories are restored before links. All links are created
+   before their target digests are checked, so forward references and link chains work. An entry
+   with an absolute name or a `..` refuses the hit. Cargo parses the recorded stdout, so it is
+   replayed byte for byte, with the recorded stderr after it. A restore that fails halfway removes
+   and recreates `OUT_DIR`, so the real script starts from the empty directory cargo gave it.
 
 5. **Miss.** The real binary runs with the same arguments, environment, working directory and stdin;
    its stdout and stderr are forwarded as they arrive and recorded; its exit code is returned
