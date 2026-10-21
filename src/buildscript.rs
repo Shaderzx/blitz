@@ -298,10 +298,14 @@ impl Ctx {
         Ok(Some(()))
     }
 
+    /// A directory has no blob, and a symlink's digest describes the file it resolved to, which is
+    /// not restored with it: `restore_link` reads that file through the link on every lookup. Only a
+    /// regular file entry needs its bytes here, or a link that points outside OUT_DIR misses forever.
     fn blobs_present(&self, entry: &BsEntry) -> bool {
         entry
             .files
             .iter()
+            .filter(|f| !f.dir && f.link.is_none())
             .filter_map(|f| f.digest.as_ref())
             .all(|d| self.store.find_blob(d).is_some())
     }
