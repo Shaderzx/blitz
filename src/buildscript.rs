@@ -16,10 +16,11 @@
 //! else is a miss: this module may cost a run, never a build, and it must never answer with state
 //! the inputs do not describe.
 
+use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,6 +35,7 @@ use crate::wrapper;
 /// The cache namespace holding one entry per build-script run. Blobs live in the shared CAS, so
 /// `blitz gc` trims them with everything else.
 const NAMESPACE: &str = "bsrun";
+const KEY_DOMAIN: &str = "blitz-bsrun-v2";
 
 /// Programs a build script or the C tooling behind it runs. Their identity is part of the key: a new
 /// compiler changes the objects the script produces without changing the script.
@@ -239,7 +241,7 @@ impl Ctx {
         let out_dir = env_path("OUT_DIR")?;
         let manifest = env_path("CARGO_MANIFEST_DIR")?;
         let store = Store::from_env()?;
-        let mut k = KeyBuilder::new("blitz-bsrun-v1");
+        let mut k = KeyBuilder::new(KEY_DOMAIN);
         // The script's own bytes: a recompile, a different compiler or a different linker changes
         // them, and nothing else in the key would notice.
         k.digest("real", &Digest::of_file(real).context("hashing the build script")?);
@@ -248,6 +250,13 @@ impl Ctx {
         k.part("out-dir", out_dir.as_os_str().as_encoded_bytes());
         for (name, value) in selected_env(env::var("CARGO_PKG_NAME").ok().as_deref()) {
             k.part("env", format!("{name}={value}").as_bytes());
+            if native_tool_env(&name) {
+                // A command with arguments or an unresolved override is ambiguous. Run uncached.
+                let path = wrapper::find_program(Path::new(&value)).context("unresolved native tool override")?;
+                let path = fs::canonicalize(path)?;
+                k.part("selected-tool-path", path.as_os_str().as_encoded_bytes());
+                k.digest("selected-tool", &Digest::of_file(&path)?);
+            }
         }
         for tool in TOOLS {
             k.part("tool", &tool_identity(Path::new(tool)));
@@ -268,7 +277,7 @@ impl Ctx {
             self.log("bsrun-miss", "no-entry");
             return Ok(None);
         };
-        if !entry.files.iter().all(|f| plain_name(&f.name)) || !entry.paths.iter().all(|p| !p.path.is_empty()) {
+        if !valid_entry(&entry) {
             self.log("bsrun-miss", "entry-invalid");
             return Ok(None);
         }
@@ -345,7 +354,14 @@ impl Ctx {
         for file in entry.files.iter().filter(|f| f.link.is_none()) {
             let dest = self.out_dir.join(&file.name);
             if file.dir {
-                fs::create_dir_all(&dest)?;
+                let mut builder = fs::DirBuilder::new();
+                builder.recursive(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    builder.mode(0o700);
+                }
+                builder.create(&dest)?;
                 continue;
             }
             if let Some(parent) = dest.parent() {
@@ -359,21 +375,31 @@ impl Ctx {
         }
         // A link may name another link that sorts later. Validate only after every target exists.
         for file in entry.files.iter().filter(|f| f.link.is_some()) {
-            if let Some(recorded) = &file.digest
-                && Digest::of_file(&self.out_dir.join(&file.name))? != *recorded
-            {
+            if path_digest(&self.out_dir.join(&file.name))? != file.digest {
                 bail!("symlink target changed");
             }
+        }
+        // Populate and check links before restricting access. Children precede parents even when
+        // an entry read from a cache is not sorted.
+        let mut dirs: Vec<_> = entry.files.iter().filter(|f| f.dir).collect();
+        dirs.sort_by_key(|f| std::cmp::Reverse(Path::new(&f.name).components().count()));
+        for file in dirs {
+            set_mode(&self.out_dir.join(&file.name), file.mode)?;
         }
         Ok(())
     }
 
     fn restore_link(&self, file: &BsFile, dest: &Path) -> Result<()> {
         let target = file.link.as_deref().context("no link target")?;
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
+        // No writes through links, including filesystem aliases of names in a poisoned entry.
+        let parent = dest.parent().context("a symlink has no parent")?;
+        let mut dir = self.out_dir.clone();
+        for component in parent.strip_prefix(&self.out_dir)?.components() {
+            dir.push(component);
+            if !fs::symlink_metadata(&dir)?.is_dir() {
+                bail!("symlink parent is not a directory");
+            }
         }
-        let _ = fs::remove_file(dest);
         #[cfg(unix)]
         std::os::unix::fs::symlink(target, dest)?;
         #[cfg(not(unix))]
@@ -384,6 +410,7 @@ impl Ctx {
     /// Runs the real script, forwards both streams as they arrive, and stores the run when it
     /// succeeded. The exit code is always the script's.
     fn run(&self, real: &Path, args: &[OsString]) -> i32 {
+        let started_empty = self.out_dir_empty();
         mark_started();
         let mut child = match Command::new(real)
             .args(args)
@@ -403,8 +430,12 @@ impl Ctx {
         let out_thread = std::thread::spawn(move || pump(out_pipe, false));
         let err_thread = std::thread::spawn(move || pump(err_pipe, true));
         let status = child.wait();
-        let stdout = out_thread.join().unwrap_or_default();
-        let stderr = err_thread.join().unwrap_or_default();
+        let stdout = out_thread
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("stdout pump panicked")));
+        let stderr = err_thread
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("stderr pump panicked")));
         // The streams were forwarded above; this only decides whether the run is worth storing.
         let code = match status {
             // A script killed by a signal has no code, and a cached miss must still return one: cargo
@@ -416,10 +447,15 @@ impl Ctx {
             }
         };
         self.log("bsrun-miss", &format!("ran exit={code}"));
-        if code == 0
-            && let Err(e) = self.store_run(&stdout, &stderr)
-        {
-            self.log("bsrun-miss", &format!("store-error: {e:#}"));
+        if code == 0 && started_empty {
+            match (stdout, stderr) {
+                (Ok(stdout), Ok(stderr)) => {
+                    if let Err(e) = self.store_run(&stdout, &stderr) {
+                        self.log("bsrun-miss", &format!("store-error: {e:#}"));
+                    }
+                }
+                _ => self.log("bsrun-miss", "stream-error"),
+            }
         }
         code
     }
@@ -444,6 +480,9 @@ impl Ctx {
             stderr: stderr_text.to_string(),
             stored_at: unix_secs(),
         };
+        if !valid_entry(&entry) {
+            bail!("invalid OUT_DIR entries");
+        }
         self.store.put_entry(NAMESPACE, &self.key, &entry)?;
         self.log("bsrun-store", &format!("files={} bytes={bytes}", entry.files.len()));
         self.stats("bsrun-store");
@@ -459,8 +498,9 @@ impl Ctx {
             let name = path
                 .strip_prefix(&self.out_dir)
                 .with_context(|| format!("{} is outside OUT_DIR", path.display()))?
-                .to_string_lossy()
-                .into_owned();
+                .to_str()
+                .context("an OUT_DIR entry name is not UTF-8")?
+                .to_owned();
             if !plain_name(&name) {
                 bail!("OUT_DIR entry {name} is not a plain relative path");
             }
@@ -472,10 +512,12 @@ impl Ctx {
                     Ok(resolved) if resolved.is_file() => Some(Digest::of_file(&path)?),
                     Ok(resolved) if resolved.is_dir() => bail!("symlink to a directory in OUT_DIR"),
                     Ok(_) => bail!("symlink to a special file in OUT_DIR"),
-                    Err(_) => None,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(e.into()),
                 };
                 files.push(BsFile {
                     name,
+                    dangling: digest.is_none(),
                     digest,
                     mode: mode_of(&meta),
                     link: Some(target),
@@ -488,6 +530,7 @@ impl Ctx {
                     name,
                     digest: None,
                     mode: mode_of(&meta),
+                    dangling: false,
                     link: None,
                     dir: true,
                 });
@@ -499,6 +542,7 @@ impl Ctx {
                     name,
                     digest: Some(digest),
                     mode: mode_of(&meta),
+                    dangling: false,
                     link: None,
                     dir: false,
                 });
@@ -528,21 +572,16 @@ impl Ctx {
                 } else {
                     self.manifest.join(path)
                 };
-                if fs::canonicalize(&path)
-                    .is_ok_and(|resolved| resolved.starts_with(&manifest_root) || resolved.starts_with(&out_root))
-                {
-                    // Resolve before checking containment. A lexical `..` path can name an external
-                    // input, and an unresolved path still needs its original spelling watched.
+                let original_inside = !path.components().any(|c| c == Component::ParentDir)
+                    && (path.starts_with(&manifest_root) || path.starts_with(&out_root));
+                let resolved_inside = fs::canonicalize(&path)
+                    .is_ok_and(|resolved| resolved.starts_with(&manifest_root) || resolved.starts_with(&out_root));
+                if original_inside && resolved_inside {
                     continue;
                 }
-                let digest = match fs::metadata(&path) {
-                    Ok(meta) if meta.is_dir() => bail!("rerun-if-changed names the directory {}", path.display()),
-                    Ok(meta) if meta.is_file() => Some(Digest::of_file(&path)?),
-                    Ok(_) => bail!("rerun-if-changed names the special file {}", path.display()),
-                    Err(_) => None,
-                };
+                let digest = path_digest(&path)?;
                 paths.push(BsPath {
-                    path: path.to_string_lossy().into_owned(),
+                    path: path.to_str().context("a watched path is not UTF-8")?.to_owned(),
                     digest,
                 });
             }
@@ -591,13 +630,17 @@ struct BsEntry {
 struct BsFile {
     /// Path relative to OUT_DIR, with plain components only.
     name: String,
-    /// The file's bytes, or for a symlink the digest of what it resolved to. `None` for a dangling
-    /// link, which is restored as a link and verifies nothing, and for a directory.
+    /// The file's bytes, or for a symlink the digest of what it resolved to. A link with `None`
+    /// records an explicitly dangling target, which must still be absent on lookup. Directories
+    /// also have no digest, but cannot carry a link target.
     digest: Option<Digest>,
     #[serde(default = "default_mode")]
     mode: u32,
     #[serde(default)]
     link: Option<String>,
+    /// Only a link explicitly recorded as dangling may have no target digest.
+    #[serde(default)]
+    dangling: bool,
     /// A directory to recreate rather than a file to write. Directories are entries of their own so
     /// that an empty one survives the round trip.
     #[serde(default)]
@@ -626,7 +669,7 @@ fn default_mode() -> u32 {
 /// absences and hits, whatever VAR holds by then. Trimming here rather than at each caller keeps a
 /// path with a trailing space from being recorded as one that does not exist.
 pub(crate) fn instruction<'a>(line: &'a str, name: &str) -> Option<&'a str> {
-    let rest = line.strip_prefix("cargo:")?;
+    let rest = line.trim().strip_prefix("cargo:")?;
     let rest = rest.strip_prefix(':').unwrap_or(rest);
     rest.strip_prefix(name)?.strip_prefix('=').map(str::trim)
 }
@@ -655,6 +698,9 @@ fn selected_env(pkg: Option<&str>) -> Vec<(String, String)> {
 }
 
 fn cargo_env(name: &str, prefix: Option<&str>) -> bool {
+    if name.starts_with("DEP_") {
+        return true;
+    }
     if name.starts_with("CARGO_") {
         // The jobserver token differs on every build and describes nothing the script produces.
         return name != "CARGO_MAKEFLAGS";
@@ -708,13 +754,9 @@ fn env_matches(recorded: &[(String, Option<String>)]) -> bool {
 }
 
 fn paths_match(recorded: &[BsPath]) -> bool {
-    recorded.iter().all(|path| {
-        let current = match fs::metadata(&path.path) {
-            Ok(meta) if meta.is_file() => Digest::of_file(Path::new(&path.path)).ok(),
-            _ => None,
-        };
-        current == path.digest
-    })
+    recorded
+        .iter()
+        .all(|path| path_digest(Path::new(&path.path)).is_ok_and(|current| current == path.digest))
 }
 
 /// A stored name must be a plain relative path: a name that is absolute or carries `..` would be
@@ -722,6 +764,55 @@ fn paths_match(recorded: &[BsPath]) -> bool {
 fn plain_name(name: &str) -> bool {
     let path = Path::new(name);
     !name.is_empty() && path.components().all(|c| matches!(c, Component::Normal(_)))
+}
+
+fn valid_entry(entry: &BsEntry) -> bool {
+    let mut kinds = HashMap::new();
+    for file in &entry.files {
+        if !plain_name(&file.name) || kinds.insert(canonical_name(Path::new(&file.name)), file.dir).is_some() {
+            return false;
+        }
+        if file.dir && (file.link.is_some() || file.digest.is_some())
+            || !file.dir && file.link.is_none() && file.digest.is_none()
+            || file.dangling != (file.link.is_some() && file.digest.is_none())
+        {
+            return false;
+        }
+    }
+    for file in &entry.files {
+        let mut ancestor = PathBuf::new();
+        let components: Vec<_> = Path::new(&file.name).components().collect();
+        for component in &components[..components.len().saturating_sub(1)] {
+            ancestor.push(component.as_os_str());
+            if kinds.get(&canonical_name(&ancestor)).is_some_and(|dir| !dir) {
+                return false;
+            }
+        }
+    }
+    entry.paths.iter().all(|path| !path.path.is_empty())
+}
+
+fn canonical_name(path: &Path) -> PathBuf {
+    path.components().collect()
+}
+
+fn path_digest(path: &Path) -> Result<Option<Digest>> {
+    match fs::metadata(path) {
+        Ok(meta) if meta.is_file() => Ok(Some(Digest::of_file(path)?)),
+        Ok(_) => bail!("path is not a regular file: {}", path.display()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn native_tool_env(name: &str) -> bool {
+    let bare = name
+        .strip_prefix("TARGET_")
+        .or_else(|| name.strip_prefix("HOST_"))
+        .unwrap_or(name);
+    ["CC", "CXX", "AR"]
+        .iter()
+        .any(|base| bare == *base || bare.strip_prefix(base).is_some_and(|rest| rest.starts_with('_')))
 }
 
 fn label_of(real: &Path) -> String {
@@ -732,29 +823,37 @@ fn label_of(real: &Path) -> String {
     name.strip_suffix(".blitz-real").unwrap_or(&name).to_string()
 }
 
-fn pump<R: Read>(pipe: Option<R>, to_stderr: bool) -> Vec<u8> {
+fn pump<R: Read>(pipe: Option<R>, to_stderr: bool) -> io::Result<Vec<u8>> {
     let Some(mut pipe) = pipe else {
-        return Vec::new();
+        return Err(io::Error::other("missing child pipe"));
     };
     let mut out = Vec::new();
     let mut buf = [0u8; 8192];
+    let mut forwarding = Ok(());
     loop {
-        match pipe.read(&mut buf) {
+        let n = match pipe.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => {
-                if to_stderr {
-                    let _ = std::io::stderr().write_all(&buf[..n]);
-                } else {
-                    let _ = std::io::stdout().write_all(&buf[..n]);
-                }
-                out.extend_from_slice(&buf[..n]);
-            }
-            Err(_) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if forwarding.is_ok() {
+            forwarding = if to_stderr {
+                io::stderr().write_all(&buf[..n])
+            } else {
+                io::stdout().write_all(&buf[..n])
+            };
         }
+        // Keep draining after a forwarding error so the child does not block or receive SIGPIPE.
+        out.extend_from_slice(&buf[..n]);
     }
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
-    out
+    forwarding?;
+    if to_stderr {
+        io::stderr().flush()?;
+    } else {
+        io::stdout().flush()?;
+    }
+    Ok(out)
 }
 
 #[cfg(unix)]

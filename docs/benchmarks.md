@@ -179,8 +179,9 @@ page cache by `blitz gc`.
 The same scenario measured 24.5 s for v0.2 before this work, and 23.8 s for the v0.2 control above,
 so the edit run fell by 1.7x against the control and 1.75x against the earlier figure, and reaches the
 12 s this change was aimed at. Decision counts for the 14.0 s run: 35 `bsrun-hit`, 309 unit hits, 2
-pass-throughs and 25 seeds. The run-cache-off run had the same unit counts, 311 unit hits and 3
-misses, and 25 snapshots, because more than five minutes had passed since the last snapshot.
+pass-throughs and 25 seeds. The run-cache-off run had different decisions: 311 unit hits, 3 misses,
+8 pass-throughs, 25 seeds and 25 snapshots. Its unit counts match the v0.2 control, not the cached
+v0.3 run. The snapshots ran because more than five minutes had passed since the last snapshot.
 
 Where the time went, from `cargo --timings` (unit durations, not wall time):
 
@@ -196,9 +197,10 @@ build-script runs were the head of the critical path and now restore in about a 
 each. Total unit seconds fell from 56.0 to 43.9.
 
 The cleanest single measure of the feature is the pair on the same tree: 29.3 s with
-`BLITZ_BUILD_SCRIPT_RUN=off` and 12.4 s with it on, 2.4x. The two C build scripts account for 13.5 s
-of the v0.2 critical path, and the wall gain against the v0.2 control is 9.8 s, because in v0.3 engine
-now compiles while the remaining build scripts restore instead of waiting behind them.
+`BLITZ_BUILD_SCRIPT_RUN=off` and 12.4 s with it on, 2.4x. The two C build scripts account for
+13.52 s of combined unit work in v0.2, not elapsed critical-path time: they start at 0.71 s and
+0.75 s and overlap. Engine's first start moves from 12.57 s to 2.39 s, a 10.18 s shift in the
+dependency timeline. The wall gain against the v0.2 control is 9.8 s.
 
 The cache grew from 5.7 GB to 7.1 GB over the warm-up and five edit runs; `blitz gc --max-size 6G`
 then removed 1,126 files and left 6,119 MiB, so the run entries are trimmed like everything else.

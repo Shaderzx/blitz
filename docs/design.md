@@ -120,8 +120,9 @@ build because of the cache: any internal error runs the real compiler with the o
 
 1. Pass straight through (no caching) when: no `--crate-name`; any input is `-` (stdin); `-C
    incremental=...` is present (those invocations are seeded instead, see the next section); the
-   real compiler is not a plain `rustc` (`clippy-driver` reaches it as a chained wrapper, and the
-   units behind it are cached like any other); crate types include `bin`,
+   real compiler is not a plain `rustc` (incremental units behind a chained wrapper such as
+   `clippy-driver` use incremental seeding; non-incremental chained units pass through uncached);
+   crate types include `bin`,
    `dylib` or `cdylib` (linking pulls in system state); `--emit` lacks both `link` and `metadata`;
    `BLITZ_DISABLE=1`.
    Cacheable crate types: `lib`, `rlib`, `proc-macro`, and `bin` for a build script
@@ -226,12 +227,14 @@ crate that builds C in its build script that run dominates: on engine's CI build
    executable uses the real path and mode 0755. Extra outputs, including split-debuginfo object files,
    keep their own names and mode 0644.
 
-2. **Key** (domain `blitz-bsrun-v1`):
+2. **Key** (domain `blitz-bsrun-v2`, so pre-fix entries with incomplete dependencies or streams are not reused):
    - the BLAKE3 digest of the real executable (a recompile, a new compiler or a new linker changes it);
    - `OUT_DIR` as a literal path (CI spells it identically on every run; another path is another key);
    - every environment variable cargo sets for a build script (`CARGO_*`, plus `TARGET`, `HOST`,
      `PROFILE`, `OPT_LEVEL`, `DEBUG`, `RUSTC`, `RUSTC_LINKER`), except `CARGO_MAKEFLAGS` (a jobserver
      token that changes on every build) and `NUM_JOBS` (parallelism, not output);
+   - every `DEP_*` name and value Cargo supplies from dependencies with `links`, even without an
+     explicit `rerun-if-env-changed` directive;
    - the C tooling variables a build script reads: `CC`, `CXX`, `AR`, `CFLAGS`, `CXXFLAGS`,
      `LDFLAGS`, `CPPFLAGS` in their plain, `<name>_<target>`, `TARGET_<name>` and `HOST_<name>`
      forms, plus anything starting with `PKG_CONFIG` or `CMAKE`;
@@ -240,7 +243,10 @@ crate that builds C in its build script that run dominates: on engine's CI build
    - the identity (real path, size, mtime) of `cc`, `c++`, `cmake`, `ar`, `ld`, `perl`, `pkg-config`,
      `make`, `python3`, `protoc`, `nasm`, `clang` and `git` on `PATH`, or the fact that one is
      absent. Each path is canonicalised before it is recorded, so a symlink that starts pointing at
-     another tool changes the key.
+     another tool changes the key. Explicit `CC`, `CXX` and `AR` selections, including their
+     target-specific and `TARGET_`/`HOST_` forms, also contribute their resolved path and content
+     digest. An unresolved selection, including a command string that is not a single resolvable
+     executable, bypasses the run cache.
 
 3. **Direct mode.** The stdout of a stored run is parsed for `cargo:rerun-if-env-changed=NAME` and
    `cargo:rerun-if-changed=PATH`. Each name is stored with the value the run saw, and each path
@@ -250,9 +256,12 @@ crate that builds C in its build script that run dominates: on engine's CI build
    resolves to a directory or a special file makes the run uncacheable rather than stale. Paths inside
    the crate are left out because the shim is only installed for an unpacked registry crate: its
    extraction is immutable and checksum-verified, so nothing inside it can change while the key stays
-   the same. Containment checks resolve existing paths and both roots first, so `..` and symlinks
-   cannot hide an external input. External watches retain their original path so retargeting a
-   symlink changes the bytes checked on lookup. An unresolved path is watched, not ignored.
+   the same. A watch is omitted only when both its original spelling and resolved target are inside
+   the crate or `OUT_DIR`, with no `..` in its spelling. External watches retain their original path
+   even when their current target is internal. Retargeting an external link therefore rechecks its
+   current bytes. An unresolved path is watched, not ignored. Only `NotFound` records or matches
+   absence. Directories, special files and other metadata or read errors reject caching. Instruction
+   parsing trims the complete line and its value, matching Cargo's whitespace handling.
 
 4. **Hit.** Only into an empty or missing `OUT_DIR`; anything already there belongs to this run, so the
    real script runs instead. Files are materialized with their recorded modes, directories are
@@ -260,14 +269,22 @@ crate that builds C in its build script that run dominates: on engine's CI build
    recreated with their targets: a link that resolves to a file is stored with the digest of that
    target and verified on every lookup, and a link to a directory or a special file makes the run
    uncacheable. Regular files and directories are restored before links. All links are created
-   before their target digests are checked, so forward references and link chains work. An entry
-   with an absolute name or a `..` refuses the hit. Cargo parses the recorded stdout, so it is
-   replayed byte for byte, with the recorded stderr after it. A restore that fails halfway removes
+   before their target digests are checked, so forward references and link chains work. An explicitly
+   recorded dangling link must still return `NotFound`; a target appearing later rejects the hit.
+   Before any writes, validation rejects non-normal names, normalized duplicate names, conflicting
+   types and any non-directory ancestor of another entry. Leaf symlinks may target external files,
+   but restoration never writes through them. Directory modes are applied deepest-first after the
+   tree is populated and links are checked. Cargo parses the recorded stdout, so it is replayed
+   byte for byte, with the recorded stderr after it. A restore that fails halfway removes
    and recreates `OUT_DIR`, so the real script starts from the empty directory cargo gave it.
 
 5. **Miss.** The real binary runs with the same arguments, environment, working directory and stdin;
    its stdout and stderr are forwarded as they arrive and recorded; its exit code is returned
-   unchanged. The run is stored only when it exited 0. Every internal error (no key, unreadable entry,
+   unchanged. The run is stored only when it exited 0, `OUT_DIR` was empty or missing before it
+   started, both streams were read and forwarded completely, and all output names are UTF-8.
+   Interrupted reads retry; other read or forwarding errors prevent storing the run. A forwarding
+   error does not stop draining the other output or change the script's exit code.
+   Every internal error (no key, unreadable entry,
    missing blob, disk full, a name that cannot go into the shim) falls back to running the real
    binary, so a broken cache can cost a run and never a build.
 
