@@ -325,4 +325,66 @@ second_value=$("$bsrun/target/debug/app") || fail "the restored registry build-s
   || fail "the restored build printed '$second_value', expected '$first_value'"
 ok "a registry build script is shimmed and its run is restored after a deleted target"
 
+# 13. A modern build script prints the double-colon spellings cargo accepts since 1.77:
+#     `cargo::rerun-if-env-changed` and `cargo::rustc-env`. Flipping that variable between two builds
+#     with no target directory must miss on the recorded value; reading only the single-colon spelling
+#     recorded nothing, and the shim replayed the first run's stdout, baking the old value in.
+probe=$work/probe
+probe_home=$probe/cargo-home
+probe_dep=$probe_home/registry/src/test-index/probe-dep-1.0.0
+probe_log=$work/probe.log
+mkdir -p "$probe_dep/src" "$probe/app/src"
+: >"$probe_dep/.cargo-ok"
+cat >"$probe_dep/Cargo.toml" <<'EOF'
+[package]
+name = "probe-dep"
+version = "1.0.0"
+edition = "2021"
+EOF
+cat >"$probe_dep/build.rs" <<'EOF'
+fn main() {
+    println!("cargo::rerun-if-env-changed=BLITZ_PROBE");
+    let value = std::env::var("BLITZ_PROBE").unwrap_or_default();
+    println!("cargo::rustc-env=BLITZ_PROBE={value}");
+}
+EOF
+cat >"$probe_dep/src/lib.rs" <<'EOF'
+pub const PROBE: &str = env!("BLITZ_PROBE");
+EOF
+cat >"$probe/app/Cargo.toml" <<EOF
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+probe-dep = { path = "$probe_dep" }
+EOF
+cat >"$probe/app/src/main.rs" <<'EOF'
+fn main() {
+    println!("{}", probe_dep::PROBE);
+}
+EOF
+cat >"$probe/Cargo.toml" <<'EOF'
+[workspace]
+members = ["app"]
+resolver = "2"
+EOF
+probe_build() {
+  ( cd "$probe" && CARGO_HOME=$probe_home CARGO_INCREMENTAL=0 BLITZ_CACHE_DIR=$work/probe-cache \
+    BLITZ_LOG=$probe_log RUSTC_WRAPPER=$blitz BLITZ_PROBE=$1 cargo build --offline ) >/dev/null 2>&1
+}
+: >"$probe_log"
+probe_build a || fail "the first double-colon build-script build failed"
+value=$("$probe/target/debug/app") || fail "the first double-colon build-script binary did not run"
+[ "$value" = "a" ] || fail "the first double-colon build printed '$value', expected 'a'"
+rm -rf "$probe/target"
+: >"$probe_log"
+probe_build b || fail "the second double-colon build-script build failed"
+grep -qE '^bsrun-miss[[:space:]].*env-changed' "$probe_log" \
+  || fail "no bsrun-miss env-changed line in BLITZ_LOG: $(tr '\n' ' ' <"$probe_log")"
+value=$("$probe/target/debug/app") || fail "the rebuilt double-colon build-script binary did not run"
+[ "$value" = "b" ] || fail "the rebuilt double-colon build printed '$value', expected 'b'"
+ok "cargo:: rerun-if-env-changed is recorded and flipping the value misses and rebuilds"
+
 echo "all e2e checks passed"

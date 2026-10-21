@@ -432,10 +432,10 @@ impl Ctx {
         let mut paths = Vec::new();
         for line in stdout.lines() {
             let line = line.trim_end_matches('\r');
-            if let Some(name) = line.strip_prefix("cargo:rerun-if-env-changed=") {
+            if let Some(name) = instruction(line, "rerun-if-env-changed") {
                 let value = env::var_os(name).map(|v| v.to_string_lossy().into_owned());
                 env_deps.push((name.to_string(), value));
-            } else if let Some(value) = line.strip_prefix("cargo:rerun-if-changed=") {
+            } else if let Some(value) = instruction(line, "rerun-if-changed") {
                 let path = Path::new(value);
                 let path = if path.is_absolute() {
                     path.to_path_buf()
@@ -515,6 +515,16 @@ struct BsPath {
 
 fn default_mode() -> u32 {
     0o644
+}
+
+/// The value of a build-script instruction, in either spelling cargo accepts: `cargo:name=value` and,
+/// since cargo 1.77, `cargo::name=value`. Cargo treats the two as one instruction, so the cache must
+/// too: reading only the old spelling records nothing for a script that prints the new one, and a
+/// later lookup then answers with output the recorded inputs do not describe.
+pub(crate) fn instruction<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let rest = line.strip_prefix("cargo:")?;
+    let rest = rest.strip_prefix(':').unwrap_or(rest);
+    rest.strip_prefix(name)?.strip_prefix('=')
 }
 
 fn env_path(name: &str) -> Result<PathBuf> {

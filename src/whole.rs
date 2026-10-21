@@ -595,10 +595,10 @@ fn collect_extra(contexts: &Contexts, profile_dirs: &[PathBuf]) -> Result<Vec<Ex
                     continue;
                 };
                 for line in text.lines() {
-                    if let Some(name) = line.strip_prefix("cargo:rerun-if-env-changed=") {
+                    if let Some(name) = crate::buildscript::instruction(line, "rerun-if-env-changed") {
                         let name = name.trim().to_string();
                         envs.insert(name.clone(), std::env::var(&name).ok());
-                    } else if let Some(path) = line.strip_prefix("cargo:rerun-if-changed=") {
+                    } else if let Some(path) = crate::buildscript::instruction(line, "rerun-if-changed") {
                         for found in recordable_watched(contexts, path.trim())? {
                             files.insert((found.scope.tag(), found.path.clone()), found);
                         }
