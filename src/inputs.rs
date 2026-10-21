@@ -9,7 +9,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use ignore::WalkBuilder;
@@ -21,6 +21,12 @@ const STAT_CACHE_VERSION: u32 = 1;
 
 /// Files up to this size are read into memory instead of memory-mapped when hashing.
 const SMALL_FILE: u64 = 128 << 10;
+
+/// How close a file's mtime has to be to now for its cached digest to be distrusted. A file
+/// rewritten inside the same clock tick keeps its size, mtime and inode, so a stat entry recorded
+/// moments ago can already be stale (the racy-clean rule). Such a file is hashed again; once its
+/// mtime is older than this, the stat entry is trustworthy.
+const RACY: Duration = Duration::from_secs(2);
 
 /// `<target>/blitz/statcache.json`. It lives in the target directory so a fresh checkout starts
 /// with an empty cache and a retained target keeps its digests.
@@ -105,8 +111,9 @@ fn has_workspace_table(text: &str) -> bool {
 /// Every input file of the build, relative to `root` and sorted.
 ///
 /// The walk honours `.gitignore` like a checkout does, includes hidden files (`.cargo/config.toml`
-/// is an input), and skips `.git` and the target directory, whose contents blitz itself writes.
-pub fn walk(root: &Path, skip: &Path) -> Result<Vec<PathBuf>> {
+/// is an input), and skips `.git` plus every directory blitz writes itself: the target directory and
+/// the cache stores, which can sit inside the workspace.
+pub fn walk(root: &Path, skips: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(false)
@@ -117,11 +124,7 @@ pub fn walk(root: &Path, skip: &Path) -> Result<Vec<PathBuf>> {
         .ignore(true)
         .parents(true)
         .follow_links(false);
-    let skip = if skip.starts_with(root) && skip != root {
-        Some(skip.to_path_buf())
-    } else {
-        None
-    };
+    let skips = inside(root, skips);
     builder.filter_entry(move |entry| {
         if entry.depth() == 0 {
             return true;
@@ -129,7 +132,7 @@ pub fn walk(root: &Path, skip: &Path) -> Result<Vec<PathBuf>> {
         if entry.file_name() == OsStr::new(".git") {
             return false;
         }
-        skip.as_deref() != Some(entry.path())
+        !skips.iter().any(|skip| skip == entry.path())
     });
 
     let mut out = Vec::new();
@@ -159,105 +162,77 @@ pub fn walk(root: &Path, skip: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Every input inside the workspace that an ignore rule hides from the ordinary [`walk`], found by
-/// following what the visible manifests declare: the workspace `members` and the `path`
-/// dependencies.
+/// Every `Cargo.toml` and `Cargo.lock` under `root`, found by a second walk with the ignore rules
+/// switched off.
 ///
-/// Cargo reads a vendored tree's manifests and sources even when `.gitignore` lists it, so a
-/// vendored package that nobody keys would let an edit to it hit a stale entry. Walking the whole
-/// tree with the ignore rules off would find them too, but it would also read every ignored
-/// `node_modules` on the hit path; following declarations only visits what cargo builds.
+/// Cargo reads a manifest that an ignore rule hides whenever the workspace reaches it as a member,
+/// through a `members` glob, or as a path dependency, and no dep-info file ever mentions a manifest.
+/// Keying the visible manifests alone let an edit to a gitignored member (`members = ["vendor/*"]`)
+/// hit a stale entry. Only these two file names are collected: everything else the tree holds is
+/// either already walked or too expensive to hash on the hit path, and a source file an ignored tree
+/// needs is caught as an extra input from the dep-info file of the unit that reads it.
 ///
-/// Globs in `members` are skipped: cargo expands them to directories the ordinary walk sees, and a
-/// glob that points into an ignored tree is rare enough to leave to a miss.
-pub fn hidden_manifests(root: &Path, walked: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    let root_real = fs::canonicalize(root).unwrap_or_else(|_| normalize(root));
-    let mut covered: BTreeSet<PathBuf> = walked.iter().cloned().collect();
-    let mut extra: Vec<PathBuf> = Vec::new();
-
-    // The lock file is read by cargo even when an ignore rule hides it.
-    let lock = PathBuf::from("Cargo.lock");
-    if root.join(&lock).is_file() && covered.insert(lock.clone()) {
-        extra.push(lock);
-    }
-
-    let mut pending: Vec<PathBuf> = Vec::new();
-    for rel in walked {
-        if rel.file_name() == Some(OsStr::new("Cargo.toml")) {
-            if let Some(dir) = rel.parent() {
-                pending.push(root.join(dir));
-            }
+/// A manifest that cannot be read is skipped rather than failing the key: cargo will report it when
+/// it builds, and a cache problem must never turn into a failed build.
+pub fn manifests(root: &Path, skips: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .require_git(false)
+        .git_ignore(false)
+        .git_exclude(false)
+        .git_global(false)
+        .ignore(false)
+        .parents(false)
+        .follow_links(false);
+    let skips = inside(root, skips);
+    builder.filter_entry(move |entry| {
+        if entry.depth() == 0 {
+            return true;
         }
-    }
-
-    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
-    while let Some(dir) = pending.pop() {
-        let Ok(text) = fs::read_to_string(dir.join("Cargo.toml")) else {
-            continue;
-        };
-        let mut declared: Vec<PathBuf> = member_dirs(&text).into_iter().map(|m| dir.join(m)).collect();
-        declared.extend(path_values(&text).into_iter().map(|p| dir.join(p)));
-        for target in declared {
-            let real = fs::canonicalize(&target).unwrap_or_else(|_| normalize(&target));
-            if !real.starts_with(&root_real) || real == root_real || !real.join("Cargo.toml").is_file() {
-                // Outside the root is `external_packages`' job, the root itself is already walked,
-                // and anything else is not a package.
-                continue;
-            }
-            if !seen.insert(real.clone()) {
-                continue;
-            }
-            let Ok(rel_dir) = real.strip_prefix(&root_real) else {
-                continue;
-            };
-            if !covered.contains(&rel_dir.join("Cargo.toml")) {
-                for rel in walk(&real, &real.join("target"))? {
-                    let path = rel_dir.join(rel);
-                    if covered.insert(path.clone()) {
-                        extra.push(path);
-                    }
-                }
-            }
-            pending.push(real);
+        if entry.file_name() == OsStr::new(".git") {
+            return false;
         }
-    }
-    extra.sort();
-    Ok(extra)
-}
+        !skips.iter().any(|skip| skip == entry.path())
+    });
 
-/// The literal directories in a manifest's `[workspace] members` list, ignoring globs.
-fn member_dirs(text: &str) -> Vec<String> {
-    let Some(start) = text.find("members") else {
-        return Vec::new();
-    };
-    let rest = &text[start..];
-    let Some(open) = rest.find('[') else {
-        return Vec::new();
-    };
-    let Some(end) = rest[open..].find(']') else {
-        return Vec::new();
-    };
-    quoted_values(&rest[open + 1..open + end])
-        .into_iter()
-        .filter(|value| !value.contains(['*', '?', '[']))
-        .collect()
-}
-
-/// Every quoted string in `text`, in order.
-fn quoted_values(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '"' && c != '\'' {
+    for entry in builder.build() {
+        let entry = entry.with_context(|| format!("walking {} for manifests", root.display()))?;
+        if entry.depth() == 0 {
             continue;
         }
-        let mut value = String::new();
-        for next in chars.by_ref() {
-            if next == c {
-                out.push(std::mem::take(&mut value));
-                break;
+        let name = entry.file_name();
+        if name != OsStr::new("Cargo.toml") && name != OsStr::new("Cargo.lock") {
+            continue;
+        }
+        // A symlinked manifest counts as a file, and one that cannot be read is skipped: cargo
+        // reports it when it builds.
+        if !fs::metadata(entry.path()).is_ok_and(|meta| meta.is_file()) || fs::File::open(entry.path()).is_err() {
+            continue;
+        }
+        let rel = entry
+            .path()
+            .strip_prefix(root)
+            .with_context(|| format!("{} is outside {}", entry.path().display(), root.display()))?;
+        out.push(rel.to_path_buf());
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// The entries of `skips` that sit inside `root`, and never `root` itself: a walk that skipped its
+/// own start would hash nothing. Each skip is returned both as given and canonicalised, because the
+/// walk yields paths built from `root` while the cache store roots are canonicalised.
+fn inside(root: &Path, skips: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for skip in skips {
+        let literal = absolute(skip);
+        let real = fs::canonicalize(skip).unwrap_or_else(|_| literal.clone());
+        for form in [literal, real] {
+            if form.starts_with(root) && form != root && !out.contains(&form) {
+                out.push(form);
             }
-            value.push(next);
         }
     }
     out
@@ -328,7 +303,7 @@ pub fn external_packages(root: &Path, files: &[PathBuf]) -> Result<Vec<External>
 
     let mut out = Vec::new();
     while let Some((label, dir)) = queue.pop() {
-        let walked = walk(&dir, &dir.join("target"))?;
+        let walked = walk(&dir, &[dir.join("target")])?;
         for rel in &walked {
             if rel.file_name() == Some(OsStr::new("Cargo.toml")) {
                 let sub = dir.join(rel).parent().unwrap_or(&dir).to_path_buf();
@@ -470,10 +445,15 @@ impl StatCache {
         let mtime = mtime_ns(&meta);
         let inode = inode(&meta);
         self.seen.insert(key.clone());
-        if let Some(stat) = self.entries.get(&key) {
-            if stat.size == size && stat.mtime == mtime && stat.inode == inode {
-                return Ok(stat.digest);
-            }
+        // A file written within the last couple of seconds can be rewritten again without any stat
+        // field moving, so its recorded digest proves nothing yet; hash it.
+        if !racy(&meta)
+            && let Some(stat) = self.entries.get(&key)
+            && stat.size == size
+            && stat.mtime == mtime
+            && stat.inode == inode
+        {
+            return Ok(stat.digest);
         }
         // A small file costs less to read than to map, and most build inputs are small.
         let digest = if size <= SMALL_FILE {
@@ -634,6 +614,18 @@ pub fn mtime_ns(meta: &fs::Metadata) -> u64 {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+/// True when `meta`'s mtime is too close to now to tell later writes apart, including an mtime in
+/// the future, which a clock step can produce.
+fn racy(meta: &fs::Metadata) -> bool {
+    let Ok(modified) = meta.modified() else {
+        return true;
+    };
+    match SystemTime::now().duration_since(modified) {
+        Ok(age) => age < RACY,
+        Err(_) => true,
+    }
 }
 
 #[cfg(unix)]
