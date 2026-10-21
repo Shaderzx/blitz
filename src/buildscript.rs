@@ -37,7 +37,21 @@ const NAMESPACE: &str = "bsrun";
 
 /// Programs a build script or the C tooling behind it runs. Their identity is part of the key: a new
 /// compiler changes the objects the script produces without changing the script.
-const TOOLS: &[&str] = &["cc", "c++", "cmake", "ar", "ld", "perl"];
+const TOOLS: &[&str] = &[
+    "cc",
+    "c++",
+    "cmake",
+    "ar",
+    "ld",
+    "perl",
+    "pkg-config",
+    "make",
+    "python3",
+    "protoc",
+    "nasm",
+    "clang",
+    "git",
+];
 
 /// Environment cargo sets for a build script that describes the build instead of this invocation.
 /// `NUM_JOBS` is deliberately absent: it says how much parallelism the machine allows, not what the
@@ -604,12 +618,15 @@ fn cargo_env(name: &str, prefix: Option<&str>) -> bool {
     prefix.is_some_and(|p| name.strip_prefix(p).is_some_and(|rest| rest.starts_with('_')))
 }
 
-/// Identity of one program on PATH: where it resolved to, its size and its mtime. A program that is
-/// not there is recorded as absent, so installing it later changes the key.
+/// Identity of one program on PATH: the real file it resolves to, its size and its mtime. A program
+/// that is not there is recorded as absent, so installing it later changes the key. The path is
+/// canonicalised first, so a link that starts pointing at another tool changes the identity even when
+/// the link itself, its size and its mtime stay put.
 fn tool_identity(name: &Path) -> Vec<u8> {
     let Some(path) = wrapper::find_program(name) else {
         return b"absent".to_vec();
     };
+    let path = fs::canonicalize(&path).unwrap_or(path);
     let Ok(meta) = fs::metadata(&path) else {
         return b"absent".to_vec();
     };

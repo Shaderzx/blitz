@@ -227,8 +227,10 @@ crate that builds C in its build script that run dominates: on engine's CI build
      forms, plus anything starting with `PKG_CONFIG` or `CMAKE`;
    - every variable named after the crate (`AWS_LC_SYS_*`, `RING_*`): `CARGO_PKG_NAME` upper-cased
      with `-` as `_`, followed by `_`;
-   - the identity (resolved path, size, mtime) of `cc`, `c++`, `cmake`, `ar`, `ld` and `perl` on
-     `PATH`, or the fact that one is absent.
+   - the identity (real path, size, mtime) of `cc`, `c++`, `cmake`, `ar`, `ld`, `perl`, `pkg-config`,
+     `make`, `python3`, `protoc`, `nasm`, `clang` and `git` on `PATH`, or the fact that one is
+     absent. Each path is canonicalised before it is recorded, so a symlink that starts pointing at
+     another tool changes the key.
 
 3. **Direct mode.** The stdout of a stored run is parsed for `cargo:rerun-if-env-changed=NAME` and
    `cargo:rerun-if-changed=PATH`. Each name is stored with the value the run saw, and each path
@@ -263,6 +265,11 @@ What still misses: a registry crate whose build script reads something outside t
 `rerun-if-changed` is the only way such a script can tell blitz, and cargo has the same blindness. A run
 that writes outside `OUT_DIR`, into its own registry extraction or into `/tmp`, is not restored. Git
 checkouts and path crates are not shimmed at all.
+
+What the tool identities do not cover: system libraries and headers a script probes, through
+`pkg-config` or by scanning `/usr/include`, are not in the key. A changed system library under an
+unchanged toolchain can therefore hit. The CI images pin their toolchain, so this is a limit of a
+hand-managed machine, not of CI; `BLITZ_BUILD_SCRIPT_RUN=off` disables the run cache entirely.
 
 ### Incremental seeding (`src/incremental.rs`, namespace `incr`)
 
