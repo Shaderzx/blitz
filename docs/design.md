@@ -112,7 +112,7 @@ build because of the cache: any internal error runs the real compiler with the o
    lacks both `link` and `metadata`; `BLITZ_DISABLE=1`.
    Cacheable crate types: `lib`, `rlib`, `proc-macro`. A proc-macro is a linked artifact, so its key
    also covers the linker binary and the SDK variables (decision 13 in `docs/decision-trail.md`).
-2. Key (domain `blitz-unit-v1`):
+2. Key (domain `blitz-unit-v2`):
    - `rustc_identity(<rustc>)` (argv[1] is the real toolchain binary; cache by its metadata).
    - The arguments in order, each normalized: replace the out-dir's target root (the directory two
      levels above `--out-dir` when it ends in `<profile>/deps`; the build script dirs live under the
@@ -125,26 +125,35 @@ build because of the cache: any internal error runs the real compiler with the o
      `SDKROOT`, `DEVELOPER_DIR`, `MACOSX_DEPLOYMENT_TARGET`, and every `DEP_*` variable cargo set for
      the unit (the `links` metadata of its dependencies).
    - Sources:
-     - Every unit gets a dep-info pre-pass, because that is where the `# env-dep:` lines come from
-       (see the next bullet). When `CARGO_MANIFEST_DIR` is an unpacked registry crate, that is under
-       `$CARGO_HOME/registry/src` with a `.cargo-ok` file next to its `Cargo.toml`, its source files
-       are not hashed: an extraction cannot change and `Cargo.lock` pins the version. A git checkout
-       is not treated that way; its sources are hashed like a local crate's.
-     - Otherwise the pre-pass hashes every prerequisite file (path normalized in the key), and in
-       both cases the `# env-dep:NAME=VALUE` lines it reported are keyed by name and current value.
+     - When `CARGO_MANIFEST_DIR` is an unpacked registry crate (under `$CARGO_HOME/registry/src`
+       with a `.cargo-ok` file next to its `Cargo.toml`), the key stops at the normalized manifest
+       path: the extraction cannot change and `Cargo.lock` pins the version. No dep-info pre-pass
+       runs, so a cold registry unit costs one compiler process instead of two. The `# env-dep:`
+       lines the real compile writes into its `.d` are stored in the entry as name plus value (or
+       unset) and compared on every lookup; any difference is a miss, and the recompile overwrites
+       the entry with the values it saw.
+     - A git checkout is not treated that way. It, and every other unit, runs the dep-info
+       pre-pass, which hashes every prerequisite file (path normalized in the key) and keys the
+       `# env-dep:NAME=VALUE` lines by name and current value, so a changed source or variable
+       changes the key before anything can be restored.
      - When `OUT_DIR` is set (the crate has a build script), hash every file under `OUT_DIR`
        (relative paths). Generated sources and bundled native libraries live there.
 3. Hit: entry `unit/<key>` lists output files (file name, digest), the normalized stdout and
-   stderr, and the exit code (always 0; failures are not cached). Materialize every output into
+   stderr, and the environment reads recorded for a registry unit. Materialize every output into
    `--out-dir` (mode 0644), de-normalizing `.d` files on the way out (the stored `.d` has
    placeholders), replay stdout and stderr de-normalized, update the digest memo for the restored
-   files, record `unit-hit` in stats, exit 0.
+   files (for a `.d`, the digest of the de-normalized bytes written), record `unit-hit` in stats,
+   exit 0. A recorded environment value that no longer matches the current environment makes the
+   entry a miss.
 4. Miss: run the real compiler with stdout and stderr piped. Forward every stderr line to our stderr
    as it arrives (cargo reads the JSON artifact notifications on stderr for pipelining, so they must
    not be held back), and keep a copy. On exit 0, collect the outputs: files in `--out-dir` whose
    names start with `lib<crate_name><extra_filename>.` or `<crate_name><extra_filename>.` (from
    `-C extra-filename=`) and whose mtime is at or after the invocation start. Store them as blobs (the
-   `.d` file normalized first), store the entry, update the digest memo, record `unit-miss`.
+   `.d` file normalized first), store the entry, update the digest memo, record `unit-miss`. For a
+   registry unit, read the `# env-dep:` lines out of that `.d` and store them in the entry; if the
+   compile wrote no `.d`, do not store the entry, because a hit would then have nothing to compare
+   the environment against.
 5. Log one line per decision to `$BLITZ_LOG` when set: `hit|miss|pass <crate> <reason>`.
 
 ## Correctness rules
