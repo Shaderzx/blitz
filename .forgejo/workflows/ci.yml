@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Pull requests supersede each other; a push to main must always run to completion, so
+# only pull-request runs are cancelled.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    name: Check
+    runs-on: docker
+    container:
+      image: fj/ci:node22
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build and test in a Rust container
+        run: |
+          set -eu
+          name="blitz-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker create --name "$name" -w /src rust:1-bookworm sh -ec '
+            set -e
+            rustup component add rustfmt clippy
+            cargo fmt --check
+            cargo clippy --all-targets --locked -- -D warnings
+            cargo build --release --locked
+            bash tests/e2e.sh target/release/blitz
+          '
+          docker cp . "$name:/src"
+          rc=0
+          docker start -a "$name" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::the Rust container exited with status $rc"
+            exit "$rc"
+          fi
+      - name: Remove the build container
+        if: always()
+        run: docker rm -f "blitz-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >/dev/null 2>&1 || true
+
+  release:
+    name: Release
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: docker
+    container:
+      image: fj/ci:node22
+    timeout-minutes: 30
+    # The workflow token publishes the package; nothing else in this job needs write access.
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build a static Linux binary
+        run: |
+          set -eu
+          name="blitz-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-release"
+          docker create --name "$name" -w /src rust:1-bookworm sh -ec '
+            set -e
+            apt-get update
+            apt-get install -y --no-install-recommends musl-tools
+            rustup target add x86_64-unknown-linux-musl
+            cargo build --release --locked --target x86_64-unknown-linux-musl
+          '
+          docker cp . "$name:/src"
+          rc=0
+          docker start -a "$name" || rc=$?
+          mkdir -p dist
+          docker cp "$name:/src/target/x86_64-unknown-linux-musl/release/blitz" \
+            dist/blitz-x86_64-unknown-linux-musl || rc=1
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::the static build failed or produced no binary (status $rc)"
+            exit "$rc"
+          fi
+      - name: Remove the static build container
+        if: always()
+        run: |
+          docker rm -f "blitz-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-release" >/dev/null 2>&1 || true
+      - name: Publish to the generic package registry
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          server="${GITHUB_SERVER_URL:-https://forgejo.flow-master.ai}"
+          owner="${GITHUB_REPOSITORY_OWNER:-fm-tools}"
+          version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [ -z "$version" ]; then
+            echo "::error::cannot read the version from Cargo.toml"
+            exit 1
+          fi
+          binary=dist/blitz-x86_64-unknown-linux-musl
+          digest=$(sha256sum "$binary" | cut -d' ' -f1)
+          if [ -z "$digest" ]; then
+            echo "::error::sha256sum produced no digest for $binary"
+            exit 1
+          fi
+          printf '%s  %s\n' "$digest" "blitz-x86_64-unknown-linux-musl" > "$binary.sha256"
+          base="$server/api/packages/$owner/generic/blitz/$version"
+          upload() {
+            file=$1
+            code=$(curl -sS -o /tmp/upload-response -w '%{http_code}' -X PUT \
+              -H "Authorization: token $TOKEN" --upload-file "$file" \
+              "$base/$(basename "$file")")
+            case "$code" in
+              200|201|204) echo "published $(basename "$file") (HTTP $code)" ;;
+              409) echo "already published, skipping $(basename "$file")" ;;
+              401|403)
+                echo "::error::package upload was refused with HTTP $code"
+                echo "::error::registry response: $(cat /tmp/upload-response)"
+                exit 1
+                ;;
+              *)
+                echo "::error::package upload failed with HTTP $code"
+                echo "::error::registry response: $(cat /tmp/upload-response)"
+                exit 1
+                ;;
+            esac
+          }
+          upload "$binary"
+          upload "$binary.sha256"

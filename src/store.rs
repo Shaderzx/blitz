@@ -15,7 +15,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -37,22 +37,21 @@ impl Store {
             _ => default_cache_dir().context("cannot find a cache directory; set BLITZ_CACHE_DIR")?,
         };
         let readonly = std::env::var("BLITZ_READONLY").is_ok_and(|v| v == "1");
-        let mut tiers = vec![Tier { root: primary, writable: !readonly }];
+        let mut tiers = vec![Tier {
+            root: primary,
+            writable: !readonly,
+        }];
         if let Some(ro) = std::env::var_os("BLITZ_CACHE_RO") {
             for p in std::env::split_paths(&ro) {
                 if !p.as_os_str().is_empty() {
-                    tiers.push(Tier { root: p, writable: false });
+                    tiers.push(Tier {
+                        root: p,
+                        writable: false,
+                    });
                 }
             }
         }
         Ok(Store { tiers })
-    }
-
-    /// Opens a store over explicit tiers (first writable, rest read-only).
-    pub fn at(root: PathBuf, read_only: Vec<PathBuf>) -> Store {
-        let mut tiers = vec![Tier { root, writable: true }];
-        tiers.extend(read_only.into_iter().map(|root| Tier { root, writable: false }));
-        Store { tiers }
     }
 
     /// The writable tier, if any.
@@ -101,20 +100,40 @@ impl Store {
     }
 
     pub fn read_blob(&self, d: &Digest) -> Result<Vec<u8>> {
-        let p = self.find_blob(d).with_context(|| format!("blob {} is missing", d.short()))?;
+        let p = self
+            .find_blob(d)
+            .with_context(|| format!("blob {} is missing", d.short()))?;
         Ok(fs::read(p)?)
     }
 
     /// Writes blob `d` to `dest`: copied (cloned on APFS, btrfs, XFS) to a temporary file next to
     /// `dest`, given `mode` and a fresh mtime, then renamed over `dest`. Readers never see a partial file.
+    ///
+    /// With `BLITZ_VERIFY=1` the copy is re-hashed before it is published: a blob that does not match
+    /// its name is deleted from a tier this process may write and reported as an error, which every
+    /// caller turns into a miss. Verification is off by default because a blob only ever appears by
+    /// atomic rename, and hashing a 100 MB binary costs more than the rest of the hit path.
     pub fn materialize(&self, d: &Digest, dest: &Path, mode: u32) -> Result<()> {
-        let src = self.find_blob(d).with_context(|| format!("blob {} is missing", d.short()))?;
+        let src = self
+            .find_blob(d)
+            .with_context(|| format!("blob {} is missing", d.short()))?;
         let dir = dest.parent().context("destination has no parent directory")?;
         fs::create_dir_all(dir)?;
         let tmp = dir.join(format!(".blitz-{}-{}", std::process::id(), unique()));
         fs::copy(&src, &tmp).with_context(|| format!("restoring {}", dest.display()))?;
+        if verify_on() && Digest::of_file(&tmp)? != *d {
+            let _ = fs::remove_file(&tmp);
+            // A corrupt blob is worse than no blob: drop it where this process may write.
+            if self.writable_root().is_some_and(|root| src.starts_with(root)) {
+                let _ = fs::remove_file(&src);
+            }
+            bail!("blob {} does not match its digest", d.short());
+        }
         set_mode(&tmp, mode)?;
-        fs::File::options().write(true).open(&tmp)?.set_modified(SystemTime::now())?;
+        fs::File::options()
+            .write(true)
+            .open(&tmp)?
+            .set_modified(SystemTime::now())?;
         fs::rename(&tmp, dest).inspect_err(|_| {
             let _ = fs::remove_file(&tmp);
         })?;
@@ -129,7 +148,9 @@ impl Store {
     }
 
     pub fn put_entry<T: Serialize>(&self, ns: &str, key: &Digest, value: &T) -> Result<()> {
-        let Some(root) = self.writable_root() else { return Ok(()) };
+        let Some(root) = self.writable_root() else {
+            return Ok(());
+        };
         let tmp = staging_path(root)?;
         fs::write(&tmp, serde_json::to_vec(value)?)?;
         publish(&tmp, &entry_path(root, ns, key))
@@ -139,18 +160,32 @@ impl Store {
     pub fn record(&self, event: &str, detail: &str) {
         let Some(root) = self.writable_root() else { return };
         let _ = fs::create_dir_all(root);
-        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(root.join("stats.log")) {
-            let secs = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        if let Ok(mut f) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(root.join("stats.log"))
+        {
+            let secs = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
             let _ = f.write_all(format!("{secs} {event} {detail}\n").as_bytes());
         }
     }
+}
+
+/// `BLITZ_VERIFY=1` re-hashes every restored blob. Off by default; see `Store::materialize`.
+fn verify_on() -> bool {
+    std::env::var("BLITZ_VERIFY").is_ok_and(|v| v == "1")
 }
 
 fn default_cache_dir() -> Option<PathBuf> {
     if let Some(x) = std::env::var_os("XDG_CACHE_HOME").filter(|x| !x.is_empty()) {
         return Some(PathBuf::from(x).join("blitz"));
     }
-    std::env::var_os("HOME").filter(|h| !h.is_empty()).map(|h| PathBuf::from(h).join(".cache").join("blitz"))
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(|h| PathBuf::from(h).join(".cache").join("blitz"))
 }
 
 fn blob_path(root: &Path, d: &Digest) -> PathBuf {
@@ -183,7 +218,10 @@ fn publish(tmp: &Path, dest: &Path) -> Result<()> {
 fn unique() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.subsec_nanos() as u64).unwrap_or(0);
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
     (nanos << 16) ^ N.fetch_add(1, Ordering::Relaxed)
 }
 

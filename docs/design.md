@@ -44,10 +44,18 @@ without spawning rustup in the common case.
    nearest `Cargo.toml` (respecting `--manifest-path`).
 3. Compute the key (domain `blitz-whole-v1`) from:
    - every input file under the workspace root: walk with the `ignore` crate (respects `.gitignore`,
-     includes hidden files such as `.cargo/config.toml`, skips `.git/` and the target directory).
+     includes hidden files such as `.cargo/config.toml`, skips `.git/`, the target directory and
+     every cache store root, which may sit inside the workspace).
      Each file contributes its path relative to the root and its BLAKE3 digest. A stat cache
      (`<target>/blitz/statcache.json`: relative path -> size, mtime ns, inode, digest) avoids
-     re-hashing unchanged files; any metadata change means re-hash.
+     re-hashing unchanged files; any metadata change means re-hash, and a file whose mtime is within
+     2 s of now is re-hashed anyway (the racy-clean rule: a rewrite inside one clock tick moves no
+     stat field).
+   - a second walk with the ignore rules switched off adds every `Cargo.toml` and `Cargo.lock`
+     under the root, so a member an ignore rule hides (for example `members = ["vendor/*"]` with
+     `vendor/` in `.gitignore`) is still keyed. It skips `.git`, the target directory and the cache
+     store roots, collects only those two file names, and skips a manifest it cannot read rather
+     than failing the key.
    - `~/.cargo/config.toml` (or `$CARGO_HOME/config.toml`) contents if present.
    - toolchain: `rustc_identity(resolve_rustc(root))`, plus size and mtime of the `cargo` binary next
      to that rustc.
@@ -70,14 +78,33 @@ without spawning rustup in the common case.
    `compiler-artifact` messages for packages whose `manifest_path` is inside the workspace root:
    their `filenames` and `executable`. Also forward `"reason":"build-finished"` success.
    If cargo fails, return its exit code and store nothing.
-6. After a successful miss build, record extra inputs that the walk did not cover:
-   - files listed in the workspace crates' dep-info (`<target>/<profile>/deps/*.d` written in this
-     build; parse the first rule's prerequisites) that are outside the workspace root and outside
-     `$CARGO_HOME/registry` and `$CARGO_HOME/git` (registry and git sources are pinned by
-     `Cargo.lock`), with their digests;
-   - for every build script output (`<target>/<profile>/build/*/output` written in this build):
-     `cargo:rerun-if-env-changed=NAME` (record NAME and its current value, or absent) and
-     `cargo:rerun-if-changed=PATH` outside the workspace (record path and digest).
+6. After a successful miss build, record extra inputs that the walk did not cover. These are read
+   from every dep-info file and build script output in the profile directories, not only the ones
+   this build wrote, because cargo can skip a build script whose watched variable still matters.
+   Extra inputs are validated on lookup, not part of the key, so a toggling external input costs
+   one miss each way. Path dependencies outside the workspace root are walked and keyed like the
+   workspace itself (labelled by the manifest's path value, so no absolute path enters the key).
+   Any dep-info prerequisite or `rerun-if-changed` path the key does not already hold is an extra
+   input, including git-ignored files under the root; those are stored relative to the root so a
+   second checkout validates its own copy. A watched directory is recorded as its sorted tree, one
+   digest per file and a digest-free entry per directory, so adding, removing or renaming an empty
+   directory changes the value. The target directory and every cache store root are left out of the
+   tree, and a watch that resolves exactly at one of them stores no entry at all: its tree changes
+   with every build. `NotFound` is the only "absent"; any other read error
+   means no entry is stored. Every `Cargo.toml` and `Cargo.lock` under the root is keyed even when
+   git-ignored. File-valued `--config` falls back to plain
+   cargo (inline `key=value` is keyed as a string). Entries carry `ENTRY_VERSION` 3, so entries
+   from before these rules are never reused. A build that starts without a `Cargo.lock` stores no
+   entry: cargo writes the lock during that build, so the recorded key could never be looked up.
+   On a hit, every artifact path must be relative with only normal components; anything else is
+   treated as a miss before a single file is written.
+   The sources of extra inputs:
+   - every prerequisite in the workspace crates' dep-info (`<target>/<profile>/deps/*.d`, paths
+     canonicalised first) that the key does not already hold, except files under
+     `$CARGO_HOME/registry` and `$CARGO_HOME/git` (pinned by `Cargo.lock`);
+   - every build script output (`<target>/<profile>/build/*/output`): `cargo:rerun-if-env-changed=NAME`
+     (NAME and its current value, or absent) and `cargo:rerun-if-changed=PATH` (file digest, or the
+     directory's tree) when the key does not already hold it.
    Store the artifacts as blobs, then the entry, then write the stat cache.
 7. The target directory: `--target-dir` argument, else `CARGO_TARGET_DIR`, else `build.target-dir`
    in `<root>/.cargo/config.toml`, else `<root>/target`. Artifact paths are recorded relative to it,
@@ -95,8 +122,9 @@ build because of the cache: any internal error runs the real compiler with the o
    incremental=...` is present; the compiler is `clippy-driver` or anything other than a plain
    rustc; crate types include `bin`, `dylib` or `cdylib` (linking pulls in system state); `--emit`
    lacks both `link` and `metadata`; `BLITZ_DISABLE=1`.
-   Cacheable crate types: `lib`, `rlib`, `staticlib`, `proc-macro`.
-2. Key (domain `blitz-unit-v1`):
+   Cacheable crate types: `lib`, `rlib`, `proc-macro`. A proc-macro is a linked artifact, so its key
+   also covers the linker binary and the SDK variables (decision 13 in `docs/decision-trail.md`).
+2. Key (domain `blitz-unit-v2`):
    - `rustc_identity(<rustc>)` (argv[1] is the real toolchain binary; cache by its metadata).
    - The arguments in order, each normalized: replace the out-dir's target root (the directory two
      levels above `--out-dir` when it ends in `<profile>/deps`; the build script dirs live under the
@@ -106,28 +134,38 @@ build because of the cache: any internal error runs the real compiler with the o
      `<target root>/blitz/digests/<file name>` (size + mtime ns + digest) so each rlib is hashed once.
    - Environment: every `CARGO_*` variable cargo set for this invocation except `CARGO_MAKEFLAGS`
      and `CARGO_HOME`, normalized the same way; plus `RUSTC_BOOTSTRAP`, `OUT_DIR` (normalized),
-     `SDKROOT`, `MACOSX_DEPLOYMENT_TARGET`.
+     `SDKROOT`, `DEVELOPER_DIR`, `MACOSX_DEPLOYMENT_TARGET`, and every `DEP_*` variable cargo set for
+     the unit (the `links` metadata of its dependencies).
    - Sources:
-     - When `CARGO_MANIFEST_DIR` is inside `$CARGO_HOME/registry/src` or `$CARGO_HOME/git/checkouts`,
-       the sources are immutable for a given normalized path (crates.io and git revisions do not
-       change), so skip the dep-info pre-pass and key on the normalized manifest dir alone.
-     - Otherwise run a dep-info pre-pass: the same arguments with `--emit` replaced by
-       `--emit=dep-info`, `-o`/`--out-dir` pointed at a temp directory, and diagnostics discarded.
-       Parse the `.d` file: hash every prerequisite file (path normalized in the key) and record
-       `# env-dep:NAME=VALUE` lines (key on NAME and the current value).
+     - When `CARGO_MANIFEST_DIR` is an unpacked registry crate (under `$CARGO_HOME/registry/src`
+       with a `.cargo-ok` file next to its `Cargo.toml`), the key stops at the normalized manifest
+       path: the extraction cannot change and `Cargo.lock` pins the version. No dep-info pre-pass
+       runs, so a cold registry unit costs one compiler process instead of two. The `# env-dep:`
+       lines the real compile writes into its `.d` are stored in the entry as name plus value (or
+       unset) and compared on every lookup; any difference is a miss, and the recompile overwrites
+       the entry with the values it saw.
+     - A git checkout is not treated that way. It, and every other unit, runs the dep-info
+       pre-pass, which hashes every prerequisite file (path normalized in the key) and keys the
+       `# env-dep:NAME=VALUE` lines by name and current value, so a changed source or variable
+       changes the key before anything can be restored.
      - When `OUT_DIR` is set (the crate has a build script), hash every file under `OUT_DIR`
        (relative paths). Generated sources and bundled native libraries live there.
 3. Hit: entry `unit/<key>` lists output files (file name, digest), the normalized stdout and
-   stderr, and the exit code (always 0; failures are not cached). Materialize every output into
+   stderr, and the environment reads recorded for a registry unit. Materialize every output into
    `--out-dir` (mode 0644), de-normalizing `.d` files on the way out (the stored `.d` has
    placeholders), replay stdout and stderr de-normalized, update the digest memo for the restored
-   files, record `unit-hit` in stats, exit 0.
+   files (for a `.d`, the digest of the de-normalized bytes written), record `unit-hit` in stats,
+   exit 0. A recorded environment value that no longer matches the current environment makes the
+   entry a miss.
 4. Miss: run the real compiler with stdout and stderr piped. Forward every stderr line to our stderr
    as it arrives (cargo reads the JSON artifact notifications on stderr for pipelining, so they must
    not be held back), and keep a copy. On exit 0, collect the outputs: files in `--out-dir` whose
    names start with `lib<crate_name><extra_filename>.` or `<crate_name><extra_filename>.` (from
    `-C extra-filename=`) and whose mtime is at or after the invocation start. Store them as blobs (the
-   `.d` file normalized first), store the entry, update the digest memo, record `unit-miss`.
+   `.d` file normalized first), store the entry, update the digest memo, record `unit-miss`. For a
+   registry unit, read the `# env-dep:` lines out of that `.d` and store them in the entry; if the
+   compile wrote no `.d`, do not store the entry, because a hit would then have nothing to compare
+   the environment against.
 5. Log one line per decision to `$BLITZ_LOG` when set: `hit|miss|pass <crate> <reason>`.
 
 ## Correctness rules
