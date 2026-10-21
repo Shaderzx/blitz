@@ -99,6 +99,7 @@ const SUBCOMMANDS: &[&str] = &[
     "stats",
     "gc",
     "cache-dir",
+    "build-script-run",
     "help",
     "-h",
     "--help",
@@ -418,6 +419,16 @@ impl Ctx<'_> {
                 write_atomic(&dest, &bytes, output.mode)?;
                 // The memo has to describe the bytes on disk, which are not the stored text.
                 Digest::of_bytes(&bytes)
+            } else if self.build_script && self.registry {
+                // Every other output of a build-script unit is the real executable. The entry names it
+                // under the plain crate name, the name v0.2 used, but the bytes go next to the shim and
+                // the shim itself is written fresh because it names this blitz.
+                let exe = self.out_dir.join(&self.executable_name());
+                let real = crate::buildscript::real_path(&exe);
+                self.store.materialize(&output.digest, &real, output.mode)?;
+                crate::buildscript::write_shim(&exe)?;
+                remember_digest(self.target_root, &real, &output.digest);
+                continue;
             } else {
                 self.store.materialize(&output.digest, &dest, output.mode)?;
                 output.digest
@@ -471,7 +482,31 @@ impl Ctx<'_> {
         let mut outputs = Vec::new();
         let mut skipped = false;
         let mut env_deps = None;
+        // Cargo runs a build script itself, after this wrapper returns, so the compile cache cannot
+        // answer the run. Renaming the executable and leaving a shim in its place turns that run into
+        // `blitz build-script-run`, which caches OUT_DIR and stdout. Only an unpacked registry crate:
+        // its sources cannot change under the key, so the script's own bytes and the environment
+        // describe the run. A failure leaves the compile's output untouched and logs why.
+        let exe_name = self.executable_name();
+        let shimmed = self.build_script && self.registry && {
+            match crate::buildscript::install_shim(&self.out_dir.join(&exe_name)) {
+                Ok(()) => true,
+                Err(e) => {
+                    log_decision("bsrun-shim", self.krate, &format!("error: {e:#}"));
+                    false
+                }
+            }
+        };
         for (name, stamp) in scan_out_dir(self.out_dir, &prefixes) {
+            // The shim carries this blitz's path and is written fresh on every restore, so it is not
+            // part of the entry. The real executable next to it is stored under the plain crate name,
+            // which is the name v0.2 used: an entry written here is still readable by a v0.2 binary,
+            // and a v0.2 entry restores correctly here.
+            let stored_name = match (shimmed, name.strip_suffix(".blitz-real")) {
+                (true, Some(stem)) => stem.to_string(),
+                (true, None) if name == exe_name => continue,
+                _ => name.clone(),
+            };
             // rustc rewrites every output it produces, so a candidate whose size and mtime are
             // untouched belongs to an earlier build of this unit and is not part of this entry.
             if before.get(&name) == Some(&stamp) {
@@ -501,7 +536,11 @@ impl Ctx<'_> {
                 (stored, stored)
             };
             remember_digest(self.target_root, &path, &on_disk);
-            outputs.push(UnitOutput { name, digest, mode });
+            outputs.push(UnitOutput {
+                name: stored_name,
+                digest,
+                mode,
+            });
         }
         if skipped {
             // This unit normally writes a file that this compile left untouched: storing the rest
@@ -536,6 +575,11 @@ impl Ctx<'_> {
         self.store.record("unit-miss", self.krate);
         log_decision("miss", self.krate, "compiled");
         Ok(Outcome::Done(code))
+    }
+
+    /// The build script's executable name as rustc writes it: the crate name plus `extra-filename`.
+    fn executable_name(&self) -> String {
+        format!("{}{}", self.krate.replace('-', "_"), self.extra_filename)
     }
 
     fn output_prefixes(&self) -> Vec<String> {

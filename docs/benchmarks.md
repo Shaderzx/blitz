@@ -145,6 +145,64 @@ in 100 ms for the binary lineage, about 0.8% of a 44 s cold build.
 Raw runs: [`bench/results-engine-2026-10-21-v0.2-before.json`](../bench/results-engine-2026-10-21-v0.2-before.json)
 and [`bench/results-engine-2026-10-21-v0.2-after.json`](../bench/results-engine-2026-10-21-v0.2-after.json).
 
+## v0.3: cached build-script runs (2026-10-21)
+
+Measured on the CI host, fm-hel-03-ai (x86_64, 64 cores, Docker `rust:1-bookworm`, rustc 1.99.1),
+with the same paths CI uses (`/src`, `/target`, `/blitz-cache`), `CARGO_BUILD_JOBS=4`, engine
+`cargo test --no-run --locked --timings` in the dev profile with `CARGO_PROFILE_DEV_DEBUG` and
+`CARGO_PROFILE_TEST_DEBUG` set to `line-tables-only`. Each run starts with
+`find /target -mindepth 1 -delete` after one probe function is appended to `src/lib.rs`.
+
+Both binaries ran the same recipe minutes apart on the same host. v0.2.0 (`d178be2`) used its own
+empty cache (`/blitz-cache-v02`), warmed first; v0.3.0 used the warm v0.2 cache with its new entries
+added.
+
+| run | seconds |
+| --- | --- |
+| v0.2, warm-up (empty cache) | 120.1 |
+| v0.2, edit run | 23.8 |
+| v0.3, warm-up (v0.2 entries reused) | 48.8 |
+| v0.3, edit run | **14.0** |
+| v0.3, edit run minutes later, same recipe | 12.4 |
+| v0.3, the same edit run again, identical inputs | 8.9 |
+| v0.3, edit run with `CARGO_BUILD_JOBS=16` | 14.2 |
+| v0.3, edit run on the same tree with the run cache off (`BLITZ_BUILD_SCRIPT_RUN=off`) | 29.3 |
+| v0.3, edit run with the final binary, after `blitz gc` had trimmed the cache | 17.9 |
+
+Five v0.3 edit runs on this recipe measured 12.4, 13.7, 14.0, 14.2 and 17.9 s. The unit work was the
+same in all of them (309 unit hits, 35 run hits, 2 pass-throughs, 25 seeds); what moved was how long
+the restores take, and the 17.9 s run paid for a cache whose blobs had just been trimmed out of the
+page cache by `blitz gc`.
+
+The same scenario measured 24.5 s for v0.2 before this work, and 23.8 s for the v0.2 control above,
+so the edit run fell by 1.7x against the control and 1.75x against the earlier figure, and reaches the
+12 s this change was aimed at. Decision counts for the 14.0 s run: 35 `bsrun-hit`, 309 unit hits, 2
+pass-throughs and 25 seeds. The run-cache-off run had the same unit counts, 311 unit hits and 3
+misses, and 25 snapshots, because more than five minutes had passed since the last snapshot.
+
+Where the time went, from `cargo --timings` (unit durations, not wall time):
+
+| unit | v0.2 seconds | v0.3 seconds | v0.3 start |
+| --- | --- | --- | --- |
+| `aws-lc-sys` build-script run | 11.45 | 0.12 | 0.79 |
+| `ring` build-script run | 2.07 | 0.03 | 0.83 |
+| `engine` lib, test build | 6.46 | 6.38 | 2.40 |
+| `engine` lib | 3.82 | 3.96 | 2.39 |
+
+Nothing of engine started before 12.57 s in the v0.2 run, and 2.39 s in the v0.3 run: the
+build-script runs were the head of the critical path and now restore in about a tenth of a second
+each. Total unit seconds fell from 56.0 to 43.9.
+
+The cleanest single measure of the feature is the pair on the same tree: 29.3 s with
+`BLITZ_BUILD_SCRIPT_RUN=off` and 12.4 s with it on, 2.4x. The two C build scripts account for 13.5 s
+of the v0.2 critical path, and the wall gain against the v0.2 control is 9.8 s, because in v0.3 engine
+now compiles while the remaining build scripts restore instead of waiting behind them.
+
+The cache grew from 5.7 GB to 7.1 GB over the warm-up and five edit runs; `blitz gc --max-size 6G`
+then removed 1,126 files and left 6,119 MiB, so the run entries are trimmed like everything else.
+
+Raw numbers: [`bench/results-engine-2026-10-21-v0.3-ci.json`](../bench/results-engine-2026-10-21-v0.3-ci.json).
+
 ## Reading the numbers
 
 - Compare `blitz cold` against `cargo cold` first. A miss path that is much slower than

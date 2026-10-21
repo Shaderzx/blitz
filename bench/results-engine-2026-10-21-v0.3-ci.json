@@ -1,0 +1,72 @@
+{
+  "date": "2026-10-21",
+  "host": "fm-hel-03-ai, x86_64, 64 cores, Docker image rust:1-bookworm",
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "repo": "flowmaster/engine",
+  "command": "cargo test --no-run --locked --timings",
+  "paths": {
+    "src": "/src",
+    "target": "/target",
+    "cache": "/blitz-cache"
+  },
+  "profile": "dev, CARGO_PROFILE_DEV_DEBUG=line-tables-only, CARGO_PROFILE_TEST_DEBUG=line-tables-only",
+  "jobs": 4,
+  "scenario": "edit run: one probe function appended to src/lib.rs, then `find /target -mindepth 1 -delete`, then the build, against a warm blitz cache",
+  "v0_2": {
+    "blitz": "0.2.0 (d178be2)",
+    "cache": "/blitz-cache-v02, empty before the warm-up",
+    "warm_up_seconds": 120.1,
+    "edit_run_seconds": 23.8,
+    "decisions": {
+      "hit": 311,
+      "miss": 3,
+      "pass": 8,
+      "seed": 25
+    },
+    "unit_seconds_total": 56.0,
+    "slowest_units": [
+      { "name": "aws-lc-sys", "unit": "build-script (run)", "seconds": 11.45, "start": 0.71 },
+      { "name": "engine", "unit": "engine \"lib\" (test)", "seconds": 6.46, "start": 12.58 },
+      { "name": "engine", "unit": "lib", "seconds": 3.82, "start": 12.57 },
+      { "name": "ring", "unit": "build-script (run)", "seconds": 2.07, "start": 0.75 }
+    ]
+  },
+  "v0_3": {
+    "blitz": "0.3.0 (v0.3 head)",
+    "cache": "/blitz-cache, the v0.2 cache with the v0.3 entries added",
+    "warm_up_seconds": 48.8,
+    "edit_run_seconds": 14.0,
+    "decisions": {
+      "bsrun_hit": 35,
+      "hit": 309,
+      "pass": 2,
+      "seed": 25
+    },
+    "unit_seconds_total": 43.9,
+    "engine_first_start_seconds": 2.39,
+    "slowest_units": [
+      { "name": "engine", "unit": "engine \"lib\" (test)", "seconds": 6.38, "start": 2.40 },
+      { "name": "engine", "unit": "lib", "seconds": 3.96, "start": 2.39 },
+      { "name": "engine", "unit": "e2e_slice \"test\" (test)", "seconds": 1.79, "start": 10.08 },
+      { "name": "engine", "unit": "mcp_internal \"test\" (test)", "seconds": 1.33, "start": 12.33 },
+      { "name": "engine", "unit": "proof_procure_to_pay \"test\" (test)", "seconds": 1.32, "start": 7.96 },
+      { "name": "engine", "unit": "proof_hire_to_retire \"test\" (test)", "seconds": 1.31, "start": 7.38 },
+      { "name": "engine", "unit": "proof_tasama \"test\" (test)", "seconds": 1.30, "start": 8.78 },
+      { "name": "engine", "unit": "proof_tasama_connected \"test\" (test)", "seconds": 1.30, "start": 12.57 },
+      { "name": "engine", "unit": "golden_envelope \"test\" (test)", "seconds": 1.27, "start": 7.40 },
+      { "name": "engine", "unit": "proof_odoo_connected \"test\" (test)", "seconds": 1.27, "start": 11.05 }
+    ],
+    "aws_lc_sys_run_seconds": 0.12,
+    "ring_run_seconds": 0.03,
+    "variants": {
+      "run_cache_off_seconds": 29.3,
+      "run_cache_off_decisions": { "hit": 311, "miss": 3, "pass": 8, "seed": 25, "snapshot": 25 },
+      "run_cache_on_same_tree_seconds": 12.4,
+      "same_inputs_again_seconds": 8.9,
+      "jobs_16_seconds": 14.2,
+      "final_binary_after_gc_seconds": 17.9,
+      "all_edit_runs_seconds": [14.0, 13.7, 12.4, 8.9, 14.2, 17.9]
+    },
+    "cache_after_runs": "7.1 GB; blitz gc --max-size 6G removed 1126 files and left 6119 MiB"
+  }
+}

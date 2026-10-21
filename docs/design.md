@@ -176,6 +176,85 @@ build because of the cache: any internal error runs the real compiler with the o
    incremental path adds `seed <crate> <files>`, `noseed <crate> <reason>` and
    `snapshot <crate> files=<n> bytes=<n> ms=<n>`.
 
+### Cached build-script runs (`src/buildscript.rs`, namespace `bsrun`)
+
+Cargo runs a build script itself: the compile goes through `RUSTC_WRAPPER`, the run does not. v0.2
+cached the compile, so a fresh target restored the executable and still paid for every run, and for a
+crate that builds C in its build script that run dominates: on engine's CI build `aws-lc-sys` took
+11.9 s of a 24.5 s edit build and nothing of engine started before 13.1 s. v0.3 caches the run too.
+
+1. **Shim.** When the wrapper compiles the build script of an unpacked registry crate
+   (`build_script_*`, crate type `bin`, manifest under `$CARGO_HOME/registry/src` with `.cargo-ok`), it
+   renames the executable to `<file>.blitz-real` and writes a `/bin/sh` shim in its place:
+
+   ```sh
+   #!/bin/sh
+   if [ -x '<blitz>' ] && [ "${BLITZ_BUILD_SCRIPT_RUN:-on}" != off ]; then
+       '<blitz>' build-script-run '<file>.blitz-real' "$@"
+       code=$?
+       if [ "$code" -ne 126 ] && [ "$code" -ne 127 ]; then exit "$code"; fi
+   fi
+   exec '<file>.blitz-real' "$@"
+   ```
+
+   The paths are absolute and single-quoted. Cargo hard-links the executable to `build-script-build`
+   after the compile returns, so whichever name it runs is the shim. The shim still works when blitz
+   is gone (a CI run whose blitz download failed reuses the same target volume) and it falls back when
+   blitz exists but cannot start at all: 126 and 127 are the shell's "could not execute" codes, and
+   every other code is the script's own and must be returned unchanged. Path and workspace crates keep
+   the plain executable, because cargo recompiles their build script whenever their sources change and
+   their runs are not the expensive ones. The per-unit entry stores the real binary (mode 0755) under
+   the plain crate name, the name v0.2 used, and never the shim; a restore writes the shim fresh, so it
+   names the blitz doing the restoring, and a v0.2 binary can still read a v0.3 entry.
+
+2. **Key** (domain `blitz-bsrun-v1`):
+   - the BLAKE3 digest of the real executable (a recompile, a new compiler or a new linker changes it);
+   - `OUT_DIR` as a literal path (CI spells it identically on every run; another path is another key);
+   - every environment variable cargo sets for a build script (`CARGO_*`, plus `TARGET`, `HOST`,
+     `PROFILE`, `OPT_LEVEL`, `DEBUG`, `RUSTC`, `RUSTC_LINKER`), except `CARGO_MAKEFLAGS` (a jobserver
+     token that changes on every build) and `NUM_JOBS` (parallelism, not output);
+   - the C tooling variables a build script reads: `CC`, `CXX`, `AR`, `CFLAGS`, `CXXFLAGS`,
+     `LDFLAGS`, `CPPFLAGS` in their plain, `<name>_<target>`, `TARGET_<name>` and `HOST_<name>`
+     forms, plus anything starting with `PKG_CONFIG` or `CMAKE`;
+   - every variable named after the crate (`AWS_LC_SYS_*`, `RING_*`): `CARGO_PKG_NAME` upper-cased
+     with `-` as `_`, followed by `_`;
+   - the identity (resolved path, size, mtime) of `cc`, `c++`, `cmake`, `ar`, `ld` and `perl` on
+     `PATH`, or the fact that one is absent.
+
+3. **Direct mode.** The stdout of a stored run is parsed for `cargo:rerun-if-env-changed=NAME` and
+   `cargo:rerun-if-changed=PATH`. Each name is stored with the value the run saw, and each path
+   outside `CARGO_MANIFEST_DIR` and outside `OUT_DIR` with the digest of the file it held, or with
+   "absent". A lookup compares every one and misses on any difference, so a table-driven build script
+   that switches on `AWS_LC_SYS_*` cannot answer with the wrong table. A `rerun-if-changed` path that
+   resolves to a directory or a special file makes the run uncacheable rather than stale. Paths inside
+   the crate are left out: the script's own bytes already change when its sources do.
+
+4. **Hit.** Only into an empty or missing `OUT_DIR`; anything already there belongs to this run, so the
+   real script runs instead. Files are materialized with their recorded modes, directories are
+   recreated, symlinks are recreated with their targets (a link that resolves to a file is stored with
+   the digest of that target and verified on every lookup; a link to a directory or a special file
+   makes the run uncacheable). An entry with an absolute name or a `..` refuses the hit. Cargo parses
+   the recorded stdout, so it is replayed byte for byte, with the recorded stderr after it. A restore
+   that fails halfway removes `OUT_DIR` again, so the real script starts from the empty directory cargo
+   gave it.
+
+5. **Miss.** The real binary runs with the same arguments, environment, working directory and stdin;
+   its stdout and stderr are forwarded as they arrive and recorded; its exit code is returned
+   unchanged. The run is stored only when it exited 0. Every internal error (no key, unreadable entry,
+   missing blob, disk full, a name that cannot go into the shim) falls back to running the real
+   binary, so a broken cache can cost a run and never a build.
+
+6. Log `bsrun-hit`, `bsrun-miss` and `bsrun-store` to `$BLITZ_LOG` in the usual format and count them
+   in `blitz stats`. `BLITZ_BUILD_SCRIPT_RUN=off` and `BLITZ_DISABLE=1` take the real binary even when
+   blitz is there. Runs live in `ac/bsrun/` with their blobs in `cas/`, so `blitz gc` trims them with
+   everything else.
+
+What still misses: a registry crate whose build script reads something outside the key (the machine's
+`/usr/include`, the time of day, a network response) produces the same key with different bytes;
+`rerun-if-changed` is the only way such a script can tell blitz, and cargo has the same blindness. A run
+that writes outside `OUT_DIR`, into its own registry extraction or into `/tmp`, is not restored. Git
+checkouts and path crates are not shimmed at all.
+
 ### Incremental seeding (`src/incremental.rs`, namespace `incr`)
 
 Cargo compiles workspace members in the dev profile with `-C incremental=<dir>`. v0.1 passed those
@@ -222,13 +301,16 @@ behind a workspace wrapper such as `clippy-driver`, takes this path:
 - A stale hit is the worst possible bug. When in doubt, miss.
 - Keys never include absolute paths that differ between checkouts, and always include everything
   that changes output bytes.
-- Failed compiles are never cached.
+- Failed compiles and failed build-script runs are never cached.
+- A cached build-script run is restored only into an empty `OUT_DIR`, and every `rerun-if-*` request
+  the script printed is compared on the way in.
 - Read-only tiers are never written (enforced in `Store`).
 
 ## Proof
 
 - `tests/e2e.sh`: drives the real `blitz` binary on a small real workspace (a binary crate plus a
   path-dependency library) in a temp dir: miss, clean, hit, edit invalidates, env change
-  invalidates, per-unit hits on a release build after `cargo clean`. One script, no unit tests.
+  invalidates, per-unit hits on a release build after `cargo clean`, a registry crate's build script
+  shimmed and its run restored into a fresh target. One script, no unit tests.
 - `bench/bench.py <repo path>`: fresh clones, measured scenarios, a markdown table. See
   `docs/benchmarks.md` for the recorded numbers.

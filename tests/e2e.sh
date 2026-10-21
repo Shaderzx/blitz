@@ -250,4 +250,79 @@ grep -qE '^seed[[:space:]]+fixture[_-]lib' "$seed_log" \
 expect_output "$seed_tree" debug fixture-value-seeded "the seeded debug build"
 ok "deleting the incremental state of a built tree seeds the edited library and prints the new value"
 
+# 12. A build script of a registry crate runs through the cache. The dependency sits in an unpacked
+#     registry extraction, the one place cargo treats sources as immutable, which is what the wrapper
+#     keys the shim on. The compile leaves a shim in front of the executable and the real binary next
+#     to it; after `rm -rf target` the unit cache restores both and the run itself is restored from
+#     the run cache (`bsrun-hit`), so cargo sees the same OUT_DIR and the binary prints the same thing
+#     as a clean build.
+bsrun=$work/bsrun
+bsrun_home=$bsrun/cargo-home
+bsrun_dep=$bsrun_home/registry/src/test-index/bsrun-dep-1.0.0
+bsrun_log=$work/bsrun.log
+mkdir -p "$bsrun_dep/src" "$bsrun/app/src"
+: >"$bsrun_dep/.cargo-ok"
+cat >"$bsrun_dep/Cargo.toml" <<'EOF'
+[package]
+name = "bsrun-dep"
+version = "1.0.0"
+edition = "2021"
+EOF
+cat >"$bsrun_dep/build.rs" <<'EOF'
+use std::fs;
+
+fn main() {
+    println!("cargo:rerun-if-changed=src/lib.rs");
+    let out = std::env::var("OUT_DIR").expect("OUT_DIR is set for a build script");
+    fs::write(format!("{out}/value.txt"), "build-script-value").expect("write the build script output");
+}
+EOF
+cat >"$bsrun_dep/src/lib.rs" <<'EOF'
+pub const VALUE: &str = include_str!(concat!(env!("OUT_DIR"), "/value.txt"));
+EOF
+cat >"$bsrun/app/Cargo.toml" <<EOF
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bsrun-dep = { path = "$bsrun_dep" }
+EOF
+cat >"$bsrun/app/src/main.rs" <<'EOF'
+fn main() {
+    println!("{}", bsrun_dep::VALUE);
+}
+EOF
+cat >"$bsrun/Cargo.toml" <<'EOF'
+[workspace]
+members = ["app"]
+resolver = "2"
+EOF
+# The path dependency is a local package, so cargo would compile the build script with `-C
+# incremental` and the per-unit cache (which installs the shim) would not see it. Registry crates in
+# a real build are not incremental; turn it off so this check exercises that path.
+( cd "$bsrun" && CARGO_HOME=$bsrun_home CARGO_INCREMENTAL=0 BLITZ_CACHE_DIR=$work/bsrun-cache \
+  RUSTC_WRAPPER=$blitz cargo build --offline ) >/dev/null 2>&1 \
+  || fail "the first registry build-script build failed"
+first_value=$("$bsrun/target/debug/app") || fail "the registry build-script binary did not run"
+[ "$first_value" = "build-script-value" ] \
+  || fail "the clean build printed '$first_value', expected 'build-script-value'"
+shim=$(find "$bsrun/target/debug/build" -name 'build_script_*' ! -name '*.d' ! -name '*.blitz-real' | head -1)
+[ -n "$shim" ] || fail "no build script executable under target/debug/build"
+[ "$(head -1 "$shim")" = '#!/bin/sh' ] \
+  || fail "the build script executable is not the blitz shim: $(head -3 "$shim")"
+[ -x "$shim.blitz-real" ] || fail "the real build script was not kept next to the shim"
+rm -rf "$bsrun/target"
+: >"$bsrun_log"
+( cd "$bsrun" && CARGO_HOME=$bsrun_home CARGO_INCREMENTAL=0 BLITZ_CACHE_DIR=$work/bsrun-cache \
+  BLITZ_LOG=$bsrun_log RUSTC_WRAPPER=$blitz cargo build --offline ) >/dev/null 2>&1 \
+  || fail "the second registry build-script build failed"
+grep -qE '^bsrun-hit[[:space:]]' "$bsrun_log" \
+  || fail "no bsrun-hit line in BLITZ_LOG: $(tr '\n' ' ' <"$bsrun_log")"
+second_value=$("$bsrun/target/debug/app") || fail "the restored registry build-script binary did not run"
+[ "$second_value" = "$first_value" ] \
+  || fail "the restored build printed '$second_value', expected '$first_value'"
+ok "a registry build script is shimmed and its run is restored after a deleted target"
+
 echo "all e2e checks passed"
