@@ -223,32 +223,31 @@ after=$( cd "$ro/prime" && find . -type f | sort | xargs shasum | shasum )
 [ "$before" = "$after" ] || fail "the read-only cache directory changed during the restore"
 ok "a read-only cache tier restores and stays unchanged"
 
-# 11. A fresh checkout has no incremental state of its own, so the first debug build of the library
-#     is seeded from the session an earlier compile stored; the edited library then compiles from
-#     that state and the binary prints the new value.
+# 11. Deleting the incremental state of a tree that has built keeps the cache, so the next compile of
+#     the edited library is seeded from the stored session. The same tree, not a copy: rustc discards
+#     a session whose command line differs, so a copy at another path would only prove where the files
+#     were put.
 seed_cache=$work/seed-cache
-seed_first=$work/seed-first
-copy_fixture "$seed_first"
-mkdir -p "$seed_first/watched"
-printf 'one\n' >"$seed_first/watched/first.txt"
-( cd "$seed_first" && BLITZ_CACHE_DIR=$seed_cache RUSTC_WRAPPER=$blitz cargo build --offline ) \
-  >/dev/null 2>&1 || fail "the debug build that fills the incremental cache failed"
-seed_second=$work/seed-second
-copy_fixture "$seed_second"
-mkdir -p "$seed_second/watched"
-printf 'one\n' >"$seed_second/watched/first.txt"
-cat >"$seed_second/lib/src/lib.rs" <<'EOF'
+seed_tree=$work/seed-tree
+copy_fixture "$seed_tree"
+mkdir -p "$seed_tree/watched"
+printf 'one\n' >"$seed_tree/watched/first.txt"
+( cd "$seed_tree" && BLITZ_CACHE_DIR=$seed_cache BLITZ_INCREMENTAL_SNAPSHOT=always \
+  RUSTC_WRAPPER=$blitz cargo build --offline ) >/dev/null 2>&1 \
+  || fail "the debug build that fills the incremental cache failed"
+rm -rf "$seed_tree/target/debug/incremental"
+cat >"$seed_tree/lib/src/lib.rs" <<'EOF'
 pub fn value() -> &'static str {
     "fixture-value-seeded"
 }
 EOF
 seed_log=$work/seed.log
 : >"$seed_log"
-( cd "$seed_second" && BLITZ_CACHE_DIR=$seed_cache BLITZ_LOG=$seed_log RUSTC_WRAPPER=$blitz cargo build --offline ) \
-  >/dev/null 2>&1 || fail "the seeded debug build failed"
+( cd "$seed_tree" && BLITZ_CACHE_DIR=$seed_cache BLITZ_LOG=$seed_log RUSTC_WRAPPER=$blitz \
+  cargo build --offline ) >/dev/null 2>&1 || fail "the seeded debug build failed"
 grep -qE '^seed[[:space:]]+fixture[_-]lib' "$seed_log" \
   || fail "no seed line for fixture_lib in BLITZ_LOG: $(tr '\n' ' ' <"$seed_log")"
-expect_output "$seed_second" debug fixture-value-seeded "the seeded debug build"
-ok "a fresh checkout is seeded from the stored incremental session and prints the new value"
+expect_output "$seed_tree" debug fixture-value-seeded "the seeded debug build"
+ok "deleting the incremental state of a built tree seeds the edited library and prints the new value"
 
 echo "all e2e checks passed"
