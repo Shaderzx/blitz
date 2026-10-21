@@ -380,6 +380,8 @@ impl Ctx {
         let stderr = err_thread.join().unwrap_or_default();
         // The streams were forwarded above; this only decides whether the run is worth storing.
         let code = match status {
+            // A script killed by a signal has no code, and a cached miss must still return one: cargo
+            // only reads a non-zero status here, and exit 1 is what a shell reports for it.
             Ok(status) => status.code().unwrap_or(1),
             Err(e) => {
                 eprintln!("blitz: lost the build script: {e}");

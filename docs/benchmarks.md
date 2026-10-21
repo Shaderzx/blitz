@@ -137,10 +137,9 @@ tree does, which is the case CI has after its first build and on every branch sw
 working copy. On a local checkout that had built once, deleting the incremental state and editing
 one library line rebuilt in 17.0 s without seeding and 2.3 s with a snapshot from that same state.
 
-Build scripts: on a fresh checkout of the same revision, 313 of 318 units came from the cache
-(35 build-script units used to miss every time). The snapshot cost measured during that
-debug build was 261 files / 314.2 MB in 249 ms for the library lineage and 218 files / 54.1 MB
-in 100 ms for the binary lineage, about 0.8% of a 44 s cold build.
+The snapshot cost measured during that debug build was 261 files / 314.2 MB in 249 ms for the
+library lineage and 218 files / 54.1 MB in 100 ms for the binary lineage, about 0.8% of a 44 s cold
+build.
 
 Raw runs: [`bench/results-engine-2026-10-21-v0.2-before.json`](../bench/results-engine-2026-10-21-v0.2-before.json)
 and [`bench/results-engine-2026-10-21-v0.2-after.json`](../bench/results-engine-2026-10-21-v0.2-after.json).
@@ -168,6 +167,9 @@ added.
 | v0.3, edit run with `CARGO_BUILD_JOBS=16` | 14.2 |
 | v0.3, edit run on the same tree with the run cache off (`BLITZ_BUILD_SCRIPT_RUN=off`) | 29.3 |
 | v0.3, edit run with the final binary, after `blitz gc` had trimmed the cache | 17.9 |
+
+On the 14.0 s run, 309 of the 311 units came from the per-unit cache and 2 passed through; the 35
+build-script units that used to miss on every build are the 35 run hits.
 
 Five v0.3 edit runs on this recipe measured 12.4, 13.7, 14.0, 14.2 and 17.9 s. The unit work was the
 same in all of them (309 unit hits, 35 run hits, 2 pass-throughs, 25 seeds); what moved was how long
