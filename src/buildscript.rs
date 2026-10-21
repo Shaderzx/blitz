@@ -589,10 +589,15 @@ fn default_mode() -> u32 {
 /// since cargo 1.77, `cargo::name=value`. Cargo treats the two as one instruction, so the cache must
 /// too: reading only the old spelling records nothing for a script that prints the new one, and a
 /// later lookup then answers with output the recorded inputs do not describe.
+///
+/// Cargo trims the value, so this does the same. An untrimmed name such as
+/// `rerun-if-env-changed=VAR ` names a variable that can never be set: every lookup compares two
+/// absences and hits, whatever VAR holds by then. Trimming here rather than at each caller keeps a
+/// path with a trailing space from being recorded as one that does not exist.
 pub(crate) fn instruction<'a>(line: &'a str, name: &str) -> Option<&'a str> {
     let rest = line.strip_prefix("cargo:")?;
     let rest = rest.strip_prefix(':').unwrap_or(rest);
-    rest.strip_prefix(name)?.strip_prefix('=')
+    rest.strip_prefix(name)?.strip_prefix('=').map(str::trim)
 }
 
 fn env_path(name: &str) -> Result<PathBuf> {

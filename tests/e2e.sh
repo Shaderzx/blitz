@@ -330,9 +330,11 @@ second_value=$("$bsrun/target/debug/app") || fail "the restored registry build-s
 ok "a registry build script is shimmed and its run is restored after a deleted target"
 
 # 13. A modern build script prints the double-colon spellings cargo accepts since 1.77:
-#     `cargo::rerun-if-env-changed` and `cargo::rustc-env`. Flipping that variable between two builds
-#     with no target directory must miss on the recorded value; reading only the single-colon spelling
-#     recorded nothing, and the shim replayed the first run's stdout, baking the old value in.
+#     `cargo::rerun-if-env-changed` and `cargo::rustc-env`, with a trailing space on the name because
+#     cargo trims it. Flipping that variable between two builds with no target directory must miss on
+#     the recorded value; reading only the single-colon spelling recorded nothing, and an untrimmed
+#     name names a variable nothing can set, so either way the shim replayed the first run's stdout
+#     and baked the old value in.
 probe=$work/probe
 probe_home=$probe/cargo-home
 probe_dep=$probe_home/registry/src/test-index/probe-dep-1.0.0
@@ -347,7 +349,7 @@ edition = "2021"
 EOF
 cat >"$probe_dep/build.rs" <<'EOF'
 fn main() {
-    println!("cargo::rerun-if-env-changed=BLITZ_PROBE");
+    println!("cargo::rerun-if-env-changed=BLITZ_PROBE ");
     let value = std::env::var("BLITZ_PROBE").unwrap_or_default();
     println!("cargo::rustc-env=BLITZ_PROBE={value}");
 }

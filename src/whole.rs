@@ -595,11 +595,12 @@ fn collect_extra(contexts: &Contexts, profile_dirs: &[PathBuf]) -> Result<Vec<Ex
                     continue;
                 };
                 for line in text.lines() {
+                    // `instruction` trims what cargo trims, so the name and the path arrive ready.
                     if let Some(name) = crate::buildscript::instruction(line, "rerun-if-env-changed") {
-                        let name = name.trim().to_string();
+                        let name = name.to_string();
                         envs.insert(name.clone(), std::env::var(&name).ok());
                     } else if let Some(path) = crate::buildscript::instruction(line, "rerun-if-changed") {
-                        for found in recordable_watched(contexts, path.trim())? {
+                        for found in recordable_watched(contexts, path)? {
                             files.insert((found.scope.tag(), found.path.clone()), found);
                         }
                     }
