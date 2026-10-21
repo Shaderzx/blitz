@@ -65,11 +65,11 @@ pub fn main(args: &[OsString]) -> i32 {
     let real = Path::new(first);
     let rest = &args[1..];
     if disabled() || !real.is_file() {
-        return wrapper::run_program(real.as_os_str(), rest);
+        return run_real(real, rest);
     }
     let Ok(ctx) = Ctx::new(real) else {
         // The key cannot be established, so the run cannot be cached: behave as if blitz were absent.
-        return wrapper::run_program(real.as_os_str(), rest);
+        return run_real(real, rest);
     };
     match ctx.lookup() {
         Ok(Some(())) => {
@@ -88,6 +88,25 @@ pub fn main(args: &[OsString]) -> i32 {
 
 fn disabled() -> bool {
     env::var("BLITZ_BUILD_SCRIPT_RUN").is_ok_and(|v| v == "off") || env::var("BLITZ_DISABLE").is_ok_and(|v| v == "1")
+}
+
+/// Runs the real script with nothing cached in front of it, after telling the shim that blitz is the
+/// one running it.
+fn run_real(real: &Path, args: &[OsString]) -> i32 {
+    mark_started();
+    wrapper::run_program(real.as_os_str(), args)
+}
+
+/// Leaves a marker at the path the shim passed in `BLITZ_BSRUN_MARK`. The shell reports 126 or 127
+/// when it cannot execute blitz at all, and so does a script that exits that way itself; the shim
+/// falls back to the real script only when no marker exists, because any other way of telling those
+/// apart would run a script that already ran a second time.
+fn mark_started() {
+    let Some(path) = env::var_os("BLITZ_BSRUN_MARK") else {
+        return;
+    };
+    // A marker that cannot be written costs the fallback its precision, never the build.
+    let _ = fs::write(PathBuf::from(path), b"");
 }
 
 /// Leaves a build script's real executable as `<exe>.blitz-real` and writes the shim in its place.
@@ -144,12 +163,18 @@ fn shim_text(blitz: &str, real: &str) -> Result<String> {
     Ok(format!(
         "#!/bin/sh\n\
          # blitz build-script shim: run this script through blitz's cache, or run it directly when\n\
-         # blitz is missing or cannot start.\n\
+         # blitz is missing or cannot start. blitz touches $BLITZ_BSRUN_MARK just before it runs the\n\
+         # real script, so 126 or 127 with no marker is the shell failing to execute blitz itself,\n\
+         # and only that falls through. A marker means the script already ran, and its own 126 or 127\n\
+         # is final: running it again would repeat its side effects and its output.\n\
          if [ -x {blitz} ] && [ \"${{BLITZ_BUILD_SCRIPT_RUN:-on}}\" != off ]; then\n\
+         \tBLITZ_BSRUN_MARK=\"${{TMPDIR:-/tmp}}/blitz-bsrun-$$\"\n\
+         \texport BLITZ_BSRUN_MARK\n\
+         \trm -f \"$BLITZ_BSRUN_MARK\"\n\
          \t{blitz} build-script-run {real} \"$@\"\n\
          \tcode=$?\n\
-         \t# 126 and 127 mean blitz itself never ran; fall through to the real script below.\n\
          \tif [ \"$code\" -ne 126 ] && [ \"$code\" -ne 127 ]; then exit \"$code\"; fi\n\
+         \tif [ -e \"$BLITZ_BSRUN_MARK\" ]; then rm -f \"$BLITZ_BSRUN_MARK\"; exit \"$code\"; fi\n\
          fi\n\
          exec {real} \"$@\"\n",
         blitz = quote(blitz)?,
@@ -314,6 +339,7 @@ impl Ctx {
     /// Runs the real script, forwards both streams as they arrive, and stores the run when it
     /// succeeded. The exit code is always the script's.
     fn run(&self, real: &Path, args: &[OsString]) -> i32 {
+        mark_started();
         let mut child = match Command::new(real)
             .args(args)
             .stdin(Stdio::inherit())
