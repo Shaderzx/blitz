@@ -76,7 +76,7 @@ fn cached(args: &[OsString], started: Instant) -> Result<i32> {
     let lock_before = root.join("Cargo.lock").is_file();
     // The target directory and, when one sits inside the workspace, every cache store root are
     // written by blitz itself; a walk that hashed them would change the key on every build.
-    let mut skips: Vec<PathBuf> = vec![target_dir.clone()];
+    let mut skips: Vec<PathBuf> = vec![skip_path(&target_dir)];
     skips.extend(store_roots(&store));
     let (key, mut statcache, files, externals) = key_of(&store, &root, &target_dir, args, &skips)?;
 
@@ -236,10 +236,7 @@ fn key_of(
 /// run with `BLITZ_CACHE_DIR=./.blitz`, a CI job that mounts it there), and its blobs and entries
 /// change on every build, so no walk or watched tree may hash them.
 fn store_roots(store: &Store) -> Vec<PathBuf> {
-    store
-        .roots()
-        .map(|(root, _)| fs::canonicalize(root).unwrap_or_else(|_| inputs::normalize(root)))
-        .collect()
+    store.roots().map(|(root, _)| skip_path(root)).collect()
 }
 
 /// The arguments that can change the build. Flags that only change the console, and the number of
@@ -499,7 +496,7 @@ fn record(
     let mut bases = inputs::package_roots(root, files);
     bases.extend(build.externals.iter().map(|e| e.dir.clone()));
     let keyed: BTreeSet<PathBuf> = files.iter().cloned().collect();
-    let mut skips = vec![fs::canonicalize(target_dir).unwrap_or_else(|_| inputs::normalize(target_dir))];
+    let mut skips = vec![skip_path(target_dir)];
     skips.extend(store_roots(store));
     let contexts = Contexts {
         root,
@@ -787,6 +784,12 @@ fn tree(dir: &Path, skips: &[PathBuf]) -> Result<Vec<TreeEntry>> {
                 .to_string_lossy()
                 .replace('\\', "/");
             if meta.is_dir() {
+                // A skipped directory (the target, a cache store) is left out entirely, not just
+                // its contents: it does not exist on a fresh checkout, so recording it would make
+                // the tree differ there and the restore could never happen.
+                if skips.contains(&real_path(&path)) {
+                    continue;
+                }
                 out.push(TreeEntry {
                     path: rel,
                     digest: None,
@@ -841,6 +844,20 @@ fn scope_of(contexts: &Contexts, abs: &Path) -> Option<(Scope, PathBuf)> {
 /// starts with the root textually while pointing outside it, and `/tmp` is a symlink on macOS.
 fn real_path(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| inputs::normalize(path))
+}
+
+/// A skip-list entry in the same spelling `real_path` gives existing paths. The target directory
+/// may not exist yet (a fresh checkout), so the parent is canonicalized and the name re-attached;
+/// otherwise `/tmp/x/target` and `/private/tmp/x/target` would never compare equal on macOS.
+fn skip_path(path: &Path) -> PathBuf {
+    if let Ok(real) = fs::canonicalize(path) {
+        return real;
+    }
+    let normal = inputs::normalize(path);
+    match (normal.parent(), normal.file_name()) {
+        (Some(parent), Some(name)) => fs::canonicalize(parent).map(|p| p.join(name)).unwrap_or(normal),
+        _ => normal,
+    }
 }
 
 #[cfg(unix)]

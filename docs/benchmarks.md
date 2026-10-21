@@ -55,12 +55,12 @@ filesystem, and disk cache state.
 
 | field | value |
 | --- | --- |
-| date | 2026-10-20 23:49 UTC |
+| date | 2026-10-21 00:50 UTC |
 | machine | MacBook Pro, Apple M5 Pro |
 | CPU / memory | 18 cores, 64 GB |
 | OS / filesystem | macOS 27.0.1, APFS |
 | rustc | rustc 1.99.0 (b940084d7 2026-09-28) |
-| blitz commit | 73fa48c (PR #1) |
+| blitz commit | bad219a (PR #1, after review rounds 1 and 2) |
 | repository and commit | flowmaster/engine 548176ad, debug profile, `--locked` |
 
 The machine was not idle: other agents were running Docker stacks and builds, load average
@@ -72,24 +72,28 @@ Raw runs: [`bench/results-engine-2026-10-21.json`](../bench/results-engine-2026-
 
 | scenario | median seconds | speedup vs cargo cold | speedup vs cargo no-op |
 | --- | --- | --- | --- |
-| cargo cold | 35.238 | 1.00x | |
-| blitz cold | 35.405 | 1.00x (0.5% slower) | |
-| blitz warm | 0.011 | **3,168x** | |
-| blitz warm + edit | 26.733 | 1.32x | |
-| cargo no-op | 0.123 | | 1.00x |
-| blitz no-op | 0.006 | | 20.5x |
+| cargo cold | 36.262 | 1.00x | |
+| blitz cold | 36.995 | 0.98x (2.0% slower) | |
+| blitz warm | 0.013 | **2,718x** | |
+| blitz warm + edit | 25.661 | 1.41x | |
+| cargo no-op | 0.136 | | 1.00x |
+| blitz no-op | 0.011 | | 12.1x |
 
 Binary check: the restored binary is executable and 102.78 MB against cargo's 102.79 MB
 (same size class; the bytes differ only in embedded checkout paths).
 
 What this says, plainly:
-- **Headline (target 144x): met, 3,168x.** A fresh checkout with an empty target directory
-  and a warm cache gets a runnable `engine` binary in 11 ms instead of 35 s.
-- The miss path costs 0.5% over plain cargo (target: under 5%).
-- After editing the top crate, the build is 1.32x faster: the dependencies are restored, but
+- **Headline (target 144x): met, 2,718x.** A fresh checkout with an empty target directory
+  and a warm cache gets a runnable `engine` binary in 13 ms instead of 36 s.
+- The miss path costs 2.0% over plain cargo (target: under 5%). Review round 1 briefly pushed
+  it to 9.8% by running a dep-info pre-pass for every registry crate; round 2 replaced that with
+  ccache-style direct mode (decision 20) and brought it back under the target.
+- After editing the top crate, the build is 1.41x faster: the dependencies are restored, but
   engine is one large crate and compiling it is most of the build. blitz cannot make rustc
   faster.
-- With nothing to do, blitz answers in 6 ms where cargo takes 123 ms.
+- With nothing to do, blitz answers in 11 ms where cargo takes 136 ms.
+- Earlier runs on the same machine: 73fa48c gave 11 ms warm (3,168x) and +0.5% cold; 8d86eb1
+  gave 11 ms warm and +9.8% cold (the regression above).
 
 ## Reading the numbers
 

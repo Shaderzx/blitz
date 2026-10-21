@@ -226,10 +226,16 @@ pub fn manifests(root: &Path, skips: &[PathBuf]) -> Result<Vec<PathBuf>> {
 /// walk yields paths built from `root` while the cache store roots are canonicalised.
 fn inside(root: &Path, skips: &[PathBuf]) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
+    let real_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     for skip in skips {
         let literal = absolute(skip);
         let real = fs::canonicalize(skip).unwrap_or_else(|_| literal.clone());
-        for form in [literal, real] {
+        // A canonical skip under a root spelled through a symlink, re-spelled under `root`.
+        let rooted = real
+            .strip_prefix(&real_root)
+            .map(|rel| root.join(rel))
+            .unwrap_or_else(|_| real.clone());
+        for form in [literal, real, rooted] {
             if form.starts_with(root) && form != root && !out.contains(&form) {
                 out.push(form);
             }

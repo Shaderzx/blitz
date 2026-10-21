@@ -20,7 +20,8 @@ pub fn parse_env_deps(text: &str) -> Vec<(String, Option<String>)> {
         let Some(rest) = line.trim_start().strip_prefix("# env-dep:") else {
             continue;
         };
-        let rest = rest.trim_end();
+        // rustc writes the value verbatim; only a CRLF line ending is not part of it.
+        let rest = rest.trim_end_matches(['\r', '\n']);
         let (name, value) = match rest.split_once('=') {
             Some((name, value)) => (name, Some(unescape(value))),
             None => (rest, None),

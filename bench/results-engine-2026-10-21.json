@@ -4,76 +4,76 @@
   "blitz": "/private/tmp/blitz/repo/target/release/blitz",
   "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
   "runs": 3,
-  "started_at": "2026-10-20T23:49:10Z",
+  "started_at": "2026-10-21T00:46:56Z",
   "scenarios": {
     "cargo cold": {
-      "median_seconds": 35.238,
+      "median_seconds": 36.262,
       "runs_seconds": [
-        35.238,
-        35.434,
-        34.939
+        37.92,
+        36.262,
+        36.176
       ]
     },
     "blitz cold": {
-      "median_seconds": 35.405,
+      "median_seconds": 36.995,
       "runs_seconds": [
-        35.405,
-        38.063,
-        35.331
+        36.995,
+        36.783,
+        38.155
       ]
     },
     "blitz warm": {
-      "median_seconds": 0.011,
+      "median_seconds": 0.013,
       "runs_seconds": [
         0.013,
-        0.011,
-        0.011,
-        0.01,
+        0.014,
+        0.014,
+        0.013,
+        0.015,
+        0.012,
+        0.014,
         0.011,
         0.013,
-        0.011,
-        0.012,
-        0.011,
-        0.012
+        0.013
       ]
     },
     "blitz warm + edit": {
-      "median_seconds": 26.733,
+      "median_seconds": 25.661,
       "runs_seconds": [
-        26.525,
-        26.733,
-        28.459
+        25.661,
+        25.381,
+        29.408
       ],
       "edited_file": "src/main.rs"
     },
     "cargo no-op": {
-      "median_seconds": 0.123,
+      "median_seconds": 0.136,
       "runs_seconds": [
+        0.127,
+        0.15,
         0.128,
-        0.113,
-        0.114,
-        0.121,
-        0.148,
         0.129,
-        0.128,
-        0.124,
-        0.116,
-        0.113
+        0.122,
+        0.145,
+        0.172,
+        0.141,
+        0.134,
+        0.139
       ]
     },
     "blitz no-op": {
-      "median_seconds": 0.006,
+      "median_seconds": 0.011,
       "runs_seconds": [
-        0.006,
-        0.006,
-        0.006,
-        0.006,
-        0.006,
-        0.005,
-        0.006,
-        0.006,
-        0.006,
-        0.006
+        0.011,
+        0.011,
+        0.014,
+        0.011,
+        0.011,
+        0.012,
+        0.012,
+        0.011,
+        0.012,
+        0.011
       ]
     }
   },
