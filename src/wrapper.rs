@@ -7,16 +7,17 @@
 //!
 //! The key covers the compiler identity, every argument (with checkout-specific paths replaced by
 //! placeholders), the contents of every `--extern` library, the environment cargo set for the unit,
-//! and the sources the unit reads. Sources come from a `.d` pre-pass for local crates; registry and
-//! git sources are immutable for a given path, so those units are keyed by the path alone.
+//! and the sources the unit reads. Every unit gets a `.d` pre-pass, because that is where rustc
+//! records which environment variables the unit read. An unpacked registry crate additionally skips
+//! hashing its sources: crates.io extractions cannot change, and `Cargo.lock` pins the version.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -27,8 +28,10 @@ use crate::normalize::{self, Normalizer};
 use crate::store::Store;
 use crate::toolchain;
 
-/// Crate types whose output is a function of the sources and the compiler alone.
-const CACHEABLE_TYPES: &[&str] = &["lib", "rlib", "staticlib", "proc-macro"];
+/// Crate types whose output is a function of the sources, the compiler and, for a proc-macro, the
+/// linker. Linked artifacts (`staticlib`, `dylib`, `cdylib`, `bin`) stay out: they carry copies of
+/// system libraries and linker output that blitz cannot see.
+const CACHEABLE_TYPES: &[&str] = &["lib", "rlib", "proc-macro"];
 
 /// Options that take their value as the following argument.
 const VALUE_FLAGS: &[&str] = &[
@@ -83,6 +86,50 @@ pub fn looks_like_compiler(arg: &OsStr) -> bool {
         .unwrap_or_default();
     let compiler = name == "rustc" || name == "clippy-driver" || name.ends_with("-rustc");
     compiler && (p.components().count() > 1 || std::env::var_os("CARGO_PKG_NAME").is_some())
+}
+
+/// The blitz subcommands. While cargo is the parent process, anything else in the first argument
+/// position is another compiler wrapper, not a subcommand.
+const SUBCOMMANDS: &[&str] = &[
+    "build",
+    "b",
+    "stats",
+    "gc",
+    "cache-dir",
+    "help",
+    "-h",
+    "--help",
+    "-V",
+    "--version",
+];
+
+/// Cargo runs `$RUSTC_WRAPPER $RUSTC_WORKSPACE_WRAPPER $RUSTC <args...>` when both wrappers are set,
+/// so blitz can be handed another wrapper as its first argument. That argument is not a blitz
+/// subcommand and must not be read as one: run the wrapper with the rest of the command line, so the
+/// chain behaves exactly as it would without blitz in the middle.
+pub fn chained(args: &[OsString]) -> Option<i32> {
+    let first = args.first()?;
+    if first.to_str().is_some_and(|f| SUBCOMMANDS.contains(&f)) || looks_like_compiler(first) {
+        return None;
+    }
+    // Cargo passes the real compiler path directly behind the wrapper, including for the
+    // `rustc -vV` probe it runs before any crate has a name, so this check must not depend on
+    // `CARGO_PKG_NAME`. Outside cargo a command that happens to sit in front of a compiler is
+    // still only treated as a wrapper when it exists as a program.
+    if !args.get(1).is_some_and(|a| looks_like_compiler(a)) {
+        return None;
+    }
+    if std::env::var_os("CARGO_PKG_NAME").is_none() && find_program(Path::new(first)).is_none() {
+        return None;
+    }
+    let code = match Command::new(first).args(&args[1..]).status() {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("blitz: cannot run {}: {e}", Path::new(first).display());
+            1
+        }
+    };
+    Some(code)
 }
 
 pub fn main(rustc: &OsStr, args: &[OsString]) -> i32 {
@@ -159,7 +206,10 @@ fn run(rustc: &OsStr, args: &[OsString]) -> Result<Outcome> {
     };
 
     let Some(key) = ctx.key(rustc, args, &inv)? else {
-        return Ok(Outcome::Pass("dep-info-failed"));
+        // The key cannot be established: no manifest, no preparse, an unresolvable linker or an
+        // OUT_DIR whose contents cannot be pinned down. Compile without the cache rather than risk
+        // a hit that does not describe this unit.
+        return Ok(Outcome::Pass("inputs-unknown"));
     };
     if ctx.restore_hit(&key)? {
         store.record("unit-hit", &krate);
@@ -209,13 +259,28 @@ impl Ctx<'_> {
         if self.sources(&mut k, rustc, args)?.is_none() {
             return Ok(None);
         }
-        if let Some(out) = std::env::var_os("OUT_DIR").filter(|v| !v.is_empty()) {
-            hash_tree(Path::new(&out), &mut k)?;
+        if inv.crate_types.iter().any(|t| t == "proc-macro") {
+            // A proc-macro is a linked artifact, and rustc records neither the linker nor the SDK it
+            // was given. An unresolvable linker means we cannot tell what produced the bytes.
+            match linker_identity(inv.linker.as_deref()) {
+                Some(d) => k.digest("linker", &d),
+                None => return Ok(None),
+            };
+        }
+        if let Some(out) = std::env::var_os("OUT_DIR").filter(|v| !v.is_empty())
+            && !hash_tree(Path::new(&out), &mut k)?
+        {
+            return Ok(None);
         }
         Ok(Some(k.finish()))
     }
 
     /// Keys the sources. `None` means the pre-pass failed, so the unit is not cacheable this time.
+    ///
+    /// The pre-pass runs for every unit, registry extractions included: its `# env-dep:` lines are
+    /// the only record of which environment variables the unit read, and a crate that reads one
+    /// produces different bytes when its value changes. Only the hashing of the source files is
+    /// skipped for a registry extraction.
     fn sources(&self, k: &mut KeyBuilder, rustc: &OsStr, args: &[OsString]) -> Result<Option<()>> {
         let Some(manifest) = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from) else {
             return Ok(None);
@@ -223,24 +288,38 @@ impl Ctx<'_> {
         let Some(cargo_home) = cargo_home() else {
             return Ok(None);
         };
-        if immutable_source(&manifest, &cargo_home) {
-            // crates.io and git sources cannot change for a given path, and Cargo.lock pins both.
-            k.part("sources", b"immutable");
-            k.part(
-                "manifest",
-                self.normalizer.normalize(&manifest.to_string_lossy()).as_bytes(),
-            );
-            return Ok(Some(()));
-        }
         let dir = self.prepass_dir();
         let info = dep_info(rustc, args, &dir);
         let _ = fs::remove_dir_all(&dir);
         let Some(info) = info else {
             return Ok(None);
         };
-        k.part("sources", b"dep-info");
+        let registry = registry_extraction(&manifest, &cargo_home);
+        k.part("sources", if registry { b"registry" } else { b"dep-info" });
+        // The normalized manifest names the crate for a registry extraction ($CARGO_HOME/registry/...)
+        // and is a constant for a local one; either way it is recorded before the sources.
+        k.part(
+            "manifest",
+            self.normalizer.normalize(&manifest.to_string_lossy()).as_bytes(),
+        );
+        if !registry {
+            self.key_prerequisites(k, info.prerequisites)?;
+        }
+        let mut env_deps = info.env_deps;
+        env_deps.sort();
+        for (name, value) in env_deps {
+            let value = value
+                .map(|v| self.normalizer.normalize(&v))
+                .unwrap_or_else(|| "<unset>".to_string());
+            k.part("env-dep", format!("{name}={value}").as_bytes());
+        }
+        Ok(Some(()))
+    }
+
+    /// Keys every source file the pre-pass reported, by normalized path and digest, once each.
+    fn key_prerequisites(&self, k: &mut KeyBuilder, deps: Vec<String>) -> Result<()> {
         let mut seen = BTreeSet::new();
-        for dep in info.prerequisites {
+        for dep in deps {
             let path = if Path::new(&dep).is_absolute() {
                 PathBuf::from(&dep)
             } else {
@@ -260,15 +339,7 @@ impl Ctx<'_> {
                 }
             }
         }
-        let mut env_deps = info.env_deps;
-        env_deps.sort();
-        for (name, value) in env_deps {
-            let value = value
-                .map(|v| self.normalizer.normalize(&v))
-                .unwrap_or_else(|| "<unset>".to_string());
-            k.part("env-dep", format!("{name}={value}").as_bytes());
-        }
-        Ok(Some(()))
+        Ok(())
     }
 
     fn prepass_dir(&self) -> PathBuf {
@@ -283,6 +354,12 @@ impl Ctx<'_> {
         let Some(entry) = self.store.get_entry::<UnitEntry>("unit", key) else {
             return Ok(false);
         };
+        let prefixes = self.output_prefixes();
+        if !entry.outputs.iter().all(|o| output_name_ok(&o.name, &prefixes)) {
+            // An entry is JSON read off the disk, not a promise: a name that is not one plain file
+            // this unit writes under `--out-dir` would be written wherever it points. Refuse the hit.
+            return Ok(false);
+        }
         if !self.store.has_all(entry.outputs.iter().map(|o| &o.digest)) {
             return Ok(false);
         }
@@ -330,25 +407,37 @@ impl Ctx<'_> {
         }
 
         let mut outputs = Vec::new();
+        let mut skipped = false;
         for (name, stamp) in scan_out_dir(self.out_dir, &prefixes) {
             // rustc rewrites every output it produces, so a candidate whose size and mtime are
             // untouched belongs to an earlier build of this unit and is not part of this entry.
             if before.get(&name) == Some(&stamp) {
+                skipped = true;
                 continue;
             }
             let path = self.out_dir.join(&name);
-            let digest = if is_dep_info(&name) {
-                let text = String::from_utf8_lossy(&fs::read(&path)?).into_owned();
-                self.store.put_bytes(self.normalizer.normalize(&text).as_bytes())?
+            // The stored `.d` carries placeholders, but the memo has to describe the bytes that are
+            // on disk, or a later lookup reuses a digest for text that was never written.
+            let (digest, on_disk) = if is_dep_info(&name) {
+                let bytes = fs::read(&path)?;
+                let text = self.normalizer.normalize(&String::from_utf8_lossy(&bytes));
+                (self.store.put_bytes(text.as_bytes())?, Digest::of_bytes(&bytes))
             } else {
-                self.store.put_file(&path)?
+                let stored = self.store.put_file(&path)?;
+                (stored, stored)
             };
-            remember_digest(self.target_root, &path, &digest);
+            remember_digest(self.target_root, &path, &on_disk);
             outputs.push(UnitOutput {
                 name,
                 digest,
                 mode: 0o644,
             });
+        }
+        if skipped {
+            // This unit normally writes a file that this compile left untouched: storing the rest
+            // would make a later hit restore a unit with a missing output, so nothing is stored.
+            log_decision("miss", self.krate, "partial-outputs");
+            return Ok(Outcome::Done(code));
         }
         if !outputs.iter().any(|o| !is_dep_info(&o.name)) {
             // An entry with nothing to restore would be a hit that leaves the unit unbuilt.
@@ -380,6 +469,7 @@ struct Invocation {
     crate_name: Option<String>,
     out_dir: Option<PathBuf>,
     extra_filename: String,
+    linker: Option<String>,
     emit: Vec<String>,
     crate_types: Vec<String>,
     incremental: bool,
@@ -423,6 +513,9 @@ fn parse(args: &[OsString]) -> Invocation {
             "-C" | "--codegen" => {
                 if let Some(rest) = value.strip_prefix("extra-filename=") {
                     inv.extra_filename = rest.to_string();
+                }
+                if let Some(rest) = value.strip_prefix("linker=") {
+                    inv.linker = Some(rest.to_string());
                 }
                 if value == "incremental" || value.starts_with("incremental=") {
                     inv.incremental = true;
@@ -487,19 +580,47 @@ fn build_normalizer(target_root: &Path) -> Normalizer {
     n
 }
 
-/// True when the crate's sources live in an immutable place: a registry extraction or a git checkout.
-fn immutable_source(manifest: &Path, cargo_home: &Path) -> bool {
-    let roots = [
-        cargo_home.join("registry").join("src"),
-        cargo_home.join("git").join("checkouts"),
-    ];
-    let forms = normalize::variants(manifest);
-    roots.iter().any(|root| {
-        let root_forms = normalize::variants(root);
-        forms
-            .iter()
-            .any(|m| root_forms.iter().any(|r| Path::new(m).starts_with(r)))
-    })
+/// True when the crate is an unpacked registry crate: it sits under `$CARGO_HOME/registry/src` and
+/// carries the `.cargo-ok` marker cargo writes after a successful extraction. Such a directory
+/// cannot change for a given path and `Cargo.lock` pins the version, so its sources need no hashing.
+///
+/// Git checkouts are deliberately excluded: a checkout can be patched, rebuilt or replaced in place,
+/// so its sources are hashed like a local crate's. So is any registry directory without `.cargo-ok`,
+/// because the marker is the only evidence that the extraction finished.
+fn registry_extraction(manifest: &Path, cargo_home: &Path) -> bool {
+    if !manifest.join("Cargo.toml").is_file() || !manifest.join(".cargo-ok").is_file() {
+        return false;
+    }
+    let root = cargo_home.join("registry").join("src");
+    let root_forms = normalize::variants(&root);
+    normalize::variants(manifest)
+        .iter()
+        .any(|m| root_forms.iter().any(|r| Path::new(m).starts_with(r)))
+}
+
+/// Identity of the linker a proc-macro is linked with: the `-C linker=` value when the build gave
+/// one, else `cc`, resolved on `PATH`, by name, size and mtime. `None` means the linker could not be
+/// resolved and the unit is therefore not cached. `SDKROOT`, `DEVELOPER_DIR` and
+/// `MACOSX_DEPLOYMENT_TARGET` are keyed with the rest of the environment. Residual risk: a shim
+/// linker that forwards to a real linker cannot be told apart from one that stopped doing so, because
+/// only the shim's own bytes and timestamp are visible here.
+fn linker_identity(linker: Option<&str>) -> Option<Digest> {
+    let name = linker.unwrap_or("cc");
+    let path = find_program(Path::new(name))?;
+    let meta = fs::metadata(&path).ok()?;
+    let mut k = KeyBuilder::new("blitz-linker-v1");
+    k.part("name", name.as_bytes());
+    k.part("len", &meta.len().to_le_bytes());
+    k.part("mtime", &mtime_ns(&meta).to_le_bytes());
+    Some(k.finish())
+}
+
+fn find_program(name: &Path) -> Option<PathBuf> {
+    if name.components().count() > 1 {
+        return name.is_file().then(|| name.to_path_buf());
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).map(|d| d.join(name)).find(|p| p.is_file())
 }
 
 struct DepInfo {
@@ -562,9 +683,11 @@ fn key_env(normalizer: &Normalizer) -> BTreeMap<String, String> {
     for (key, value) in std::env::vars_os() {
         let name = key.to_string_lossy().into_owned();
         let interesting = (name.starts_with("CARGO_") && name != "CARGO_MAKEFLAGS" && name != "CARGO_HOME")
+            // `DEP_*` carries the `links` metadata a build script published for its dependents.
+            || name.starts_with("DEP_")
             || matches!(
                 name.as_str(),
-                "RUSTC_BOOTSTRAP" | "OUT_DIR" | "SDKROOT" | "MACOSX_DEPLOYMENT_TARGET"
+                "RUSTC_BOOTSTRAP" | "OUT_DIR" | "SDKROOT" | "DEVELOPER_DIR" | "MACOSX_DEPLOYMENT_TARGET"
             );
         if interesting {
             out.insert(name, normalizer.normalize(&value.to_string_lossy()));
@@ -574,9 +697,15 @@ fn key_env(normalizer: &Normalizer) -> BTreeMap<String, String> {
 }
 
 /// Hashes every file under `root` by relative path, so build-script output cannot change unnoticed.
-fn hash_tree(root: &Path, k: &mut KeyBuilder) -> Result<()> {
+/// A symlinked file is followed, and the bytes hashed are the target's, which is what the build read.
+/// A symlinked directory, a broken link, a special file or a file that vanishes mid-walk returns
+/// `false`: the caller then does not cache the unit, which is cheaper than guessing what a tree of
+/// links contains.
+fn hash_tree(root: &Path, k: &mut KeyBuilder) -> Result<bool> {
     let mut files = Vec::new();
-    collect_files(root, root, &mut files)?;
+    if !collect_files(root, root, &mut files)? {
+        return Ok(false);
+    }
     files.sort();
     for rel in files {
         let path = root.join(&rel);
@@ -585,28 +714,35 @@ fn hash_tree(root: &Path, k: &mut KeyBuilder) -> Result<()> {
             Ok(meta) if meta.is_file() => {
                 k.digest("out-dir-file", &Digest::of_file(&path)?);
             }
-            _ => {
-                k.part("out-dir-missing", b"");
-            }
+            _ => return Ok(false),
         }
     }
-    Ok(())
+    Ok(true)
 }
 
-fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
+fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<bool> {
     for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
-        let meta = entry.metadata()?;
+        let link = entry.file_type()?.is_symlink();
+        // `fs::metadata` follows a link, so this is the type of what the build actually read.
+        let Ok(meta) = fs::metadata(&path) else {
+            return Ok(false);
+        };
         if meta.is_dir() {
-            collect_files(root, &path, out)?;
-        } else if meta.is_file()
-            && let Ok(rel) = path.strip_prefix(root)
-        {
+            if link || !collect_files(root, &path, out)? {
+                return Ok(false);
+            }
+        } else if meta.is_file() {
+            let Ok(rel) = path.strip_prefix(root) else {
+                return Ok(false);
+            };
             out.push(rel.to_string_lossy().into_owned());
+        } else {
+            return Ok(false);
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -635,20 +771,30 @@ struct Memo {
     path: String,
     len: u64,
     mtime: u64,
+    #[serde(default)]
+    inode: u64,
     digest: Digest,
 }
 
-/// Digest of `path`, memoized in the target directory by size and mtime, so each rlib is hashed
-/// once per build instead of once per dependent crate.
+/// How close a file's mtime has to be to now for its memo to be distrusted. A file replaced again
+/// inside the same clock tick keeps its size and mtime, so a memo written now can already be stale
+/// (the racy-clean rule); such a file is simply hashed again.
+const RACY: Duration = Duration::from_secs(2);
+
+/// Digest of `path`, memoized in the target directory by size, mtime and inode, so each rlib is
+/// hashed once per build instead of once per dependent crate.
 fn file_digest(target_root: &Path, path: &Path) -> Result<Digest> {
     let meta = fs::metadata(path)?;
     let len = meta.len();
     let mtime = mtime_ns(&meta);
+    let inode = inode_of(&meta);
     let memo_path = memo_path(target_root, path)?;
-    if let Ok(bytes) = fs::read(&memo_path)
+    if !racy(&meta)
+        && let Ok(bytes) = fs::read(&memo_path)
         && let Ok(memo) = serde_json::from_slice::<Memo>(&bytes)
         && memo.len == len
         && memo.mtime == mtime
+        && memo.inode == inode
         && memo.path == path.to_string_lossy()
     {
         return Ok(memo.digest);
@@ -667,11 +813,35 @@ fn remember_digest(target_root: &Path, path: &Path, digest: &Digest) {
         path: path.to_string_lossy().into_owned(),
         len: meta.len(),
         mtime: mtime_ns(&meta),
+        inode: inode_of(&meta),
         digest: *digest,
     };
     if let Ok(bytes) = serde_json::to_vec(&memo) {
         let _ = write_atomic(&memo_path, &bytes, 0o644);
     }
+}
+
+/// True when `meta`'s mtime is too close to now to tell later writes apart, including an mtime in
+/// the future, which a clock step can produce.
+fn racy(meta: &fs::Metadata) -> bool {
+    let Ok(modified) = meta.modified() else {
+        return true;
+    };
+    match SystemTime::now().duration_since(modified) {
+        Ok(age) => age < RACY,
+        Err(_) => true,
+    }
+}
+
+#[cfg(unix)]
+fn inode_of(meta: &fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.ino()
+}
+
+#[cfg(not(unix))]
+fn inode_of(_meta: &fs::Metadata) -> u64 {
+    0
 }
 
 fn memo_path(target_root: &Path, path: &Path) -> Result<PathBuf> {
@@ -750,6 +920,14 @@ fn replay(stdout: &str, stderr: &str) -> Result<()> {
 
 fn is_dep_info(name: &str) -> bool {
     name.ends_with(".d")
+}
+
+/// True when a stored output name is one plain file name, inside `--out-dir`, that starts with a
+/// prefix this unit writes. Nothing from an entry is ever joined onto a path without this check.
+fn output_name_ok(name: &str, prefixes: &[String]) -> bool {
+    let mut parts = Path::new(name).components();
+    let single = matches!(parts.next(), Some(Component::Normal(_))) && parts.next().is_none();
+    single && prefixes.iter().any(|p| name.starts_with(p.as_str()))
 }
 
 fn write_atomic(dest: &Path, data: &[u8], mode: u32) -> Result<()> {
