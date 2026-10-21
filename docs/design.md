@@ -76,6 +76,16 @@ without spawning rustup in the common case.
    Extra inputs are validated on lookup, not part of the key, so a toggling external input costs
    one miss each way. Path dependencies outside the workspace root are walked and keyed like the
    workspace itself (labelled by the manifest's path value, so no absolute path enters the key).
+   Any dep-info prerequisite or `rerun-if-changed` path the key does not already hold is an extra
+   input, including git-ignored files under the root; those are stored relative to the root so a
+   second checkout validates its own copy. A watched directory is recorded as its sorted tree
+   (relative path and digest per file). `NotFound` is the only "absent"; any other read error
+   means no entry is stored. `Cargo.lock` and every manifest reachable through `members` and
+   `path` dependencies are keyed even when git-ignored. File-valued `--config` falls back to plain
+   cargo (inline `key=value` is keyed as a string). Entries carry `ENTRY_VERSION` 2, so entries
+   from before these rules are never reused.
+   On a hit, every artifact path must be relative with only normal components; anything else is
+   treated as a miss before a single file is written.
    - files listed in the workspace crates' dep-info (`<target>/<profile>/deps/*.d`; parse the first
      rule's prerequisites, paths canonicalised first) that are outside the workspace root and outside
      `$CARGO_HOME/registry` and `$CARGO_HOME/git` (registry and git sources are pinned by
