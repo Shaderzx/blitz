@@ -111,10 +111,11 @@ fn run_real(real: &Path, args: &[OsString]) -> i32 {
     wrapper::run_program(real.as_os_str(), args)
 }
 
-/// Leaves a marker at the path the shim passed in `BLITZ_BSRUN_MARK`. The shell reports 126 or 127
-/// when it cannot execute blitz at all, and so does a script that exits that way itself; the shim
-/// falls back to the real script only when no marker exists, because any other way of telling those
-/// apart would run a script that already ran a second time.
+/// Leaves a marker at the path the shim passed in `BLITZ_BSRUN_MARK`. The shim falls back to the
+/// real script only when blitz exits non-zero and left no marker, which means blitz never started
+/// the script: that covers a blitz the shell cannot execute and one the kernel killed before it
+/// settled an entry. Any other way of telling those apart would run a script that already ran a
+/// second time.
 fn mark_started() {
     let Some(path) = env::var_os("BLITZ_BSRUN_MARK") else {
         return;
@@ -174,21 +175,29 @@ pub fn write_shim(exe: &Path) -> Result<()> {
 }
 
 fn shim_text(blitz: &str, real: &str) -> Result<String> {
+    if !Path::new(blitz).is_absolute() || !Path::new(real).is_absolute() {
+        bail!("the shim needs absolute paths");
+    }
+    // The marker sits next to the real binary, in cargo's writable build directory, and carries the
+    // shim's pid so a run of the same script never sees another run's marker. The suffix is outside
+    // the quotes on purpose: inside them the shell would not expand `$$`.
+    let mark = format!("{}.blitz-mark.$$", quote(real)?);
     Ok(format!(
         "#!/bin/sh\n\
          # blitz build-script shim: run this script through blitz's cache, or run it directly when\n\
          # blitz is missing or cannot start. blitz touches $BLITZ_BSRUN_MARK just before it runs the\n\
-         # real script, so 126 or 127 with no marker is the shell failing to execute blitz itself,\n\
-         # and only that falls through. A marker means the script already ran, and its own 126 or 127\n\
-         # is final: running it again would repeat its side effects and its output.\n\
+         # real script, so a non-zero exit with no marker means blitz never started one, and only that\n\
+         # falls through. A marker means the script already ran, and its exit code is final: running it\n\
+         # again would repeat its side effects and its output.\n\
          if [ -x {blitz} ] && [ \"${{BLITZ_BUILD_SCRIPT_RUN:-on}}\" != off ]; then\n\
-         \tBLITZ_BSRUN_MARK=\"${{TMPDIR:-/tmp}}/blitz-bsrun-$$\"\n\
+         \tBLITZ_BSRUN_MARK={mark}\n\
          \texport BLITZ_BSRUN_MARK\n\
          \trm -f \"$BLITZ_BSRUN_MARK\"\n\
          \t{blitz} build-script-run {real} \"$@\"\n\
          \tcode=$?\n\
-         \tif [ \"$code\" -ne 126 ] && [ \"$code\" -ne 127 ]; then exit \"$code\"; fi\n\
          \tif [ -e \"$BLITZ_BSRUN_MARK\" ]; then rm -f \"$BLITZ_BSRUN_MARK\"; exit \"$code\"; fi\n\
+         \tif [ \"$code\" -ne 0 ]; then exec {real} \"$@\"; fi\n\
+         \texit 0\n\
          fi\n\
          exec {real} \"$@\"\n",
         blitz = quote(blitz)?,

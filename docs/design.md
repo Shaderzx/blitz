@@ -190,13 +190,14 @@ crate that builds C in its build script that run dominates: on engine's CI build
    ```sh
    #!/bin/sh
    if [ -x '<blitz>' ] && [ "${BLITZ_BUILD_SCRIPT_RUN:-on}" != off ]; then
-       BLITZ_BSRUN_MARK="${TMPDIR:-/tmp}/blitz-bsrun-$$"
+       BLITZ_BSRUN_MARK='<file>.blitz-real'.blitz-mark.$$
        export BLITZ_BSRUN_MARK
        rm -f "$BLITZ_BSRUN_MARK"
        '<blitz>' build-script-run '<file>.blitz-real' "$@"
        code=$?
-       if [ "$code" -ne 126 ] && [ "$code" -ne 127 ]; then exit "$code"; fi
        if [ -e "$BLITZ_BSRUN_MARK" ]; then rm -f "$BLITZ_BSRUN_MARK"; exit "$code"; fi
+       if [ "$code" -ne 0 ]; then exec '<file>.blitz-real' "$@"; fi
+       exit 0
    fi
    exec '<file>.blitz-real' "$@"
    ```
@@ -204,13 +205,15 @@ crate that builds C in its build script that run dominates: on engine's CI build
    The paths are absolute and single-quoted. Cargo hard-links the executable to `build-script-build`
    after the compile returns, so whichever name it runs is the shim. The shim still works when blitz
    is gone (a CI run whose blitz download failed reuses the same target volume), and it falls back to
-   the real script only when blitz never started one. 126 and 127 mean both "the shell could not
-   execute blitz" and "the script exited 126 or 127 itself", and treating the second as the first ran
-   a script that had already run a second time, side effects and output included. blitz therefore
-   touches `$BLITZ_BSRUN_MARK`, a fresh path the shim passes in, immediately before it starts the
-   real script, whether or not the run is cached. A marker means the script is what produced the
-   code; no marker means nothing ran, so the shim execs the script. Every other exit code is the
-   script's own and is returned unchanged. Path and workspace crates keep the plain executable,
+   the real script only when blitz never started one. A non-zero exit alone does not say that: it is
+   also a script that failed, or blitz killed by the kernel, and running a script that already ran a
+   second time repeats its side effects and its output. blitz therefore touches
+   `$BLITZ_BSRUN_MARK`, `<real>.blitz-mark.$$` beside the real binary, immediately before it starts
+   the real script, whether or not the run is cached, and never removes it: the shim does. The marker
+   lives in cargo's own writable build directory, so a `$TMPDIR` that cannot be written cannot cost
+   the fallback its precision. A marker means the script is what produced the code, or is producing
+   it; no marker with a non-zero exit means nothing ran, so the shim execs the script. An exit of
+   zero removes the marker and exits 0. Path and workspace crates keep the plain executable,
    because cargo recompiles their build script whenever their sources change and their runs are not
    the expensive ones. The per-unit entry stores the real binary (mode 0755) under the plain crate
    name, the name v0.2 used, and never the shim; a restore writes the shim fresh, so it names the
