@@ -215,9 +215,10 @@ crate that builds C in its build script that run dominates: on engine's CI build
    it; no marker with a non-zero exit means nothing ran, so the shim execs the script. An exit of
    zero removes the marker and exits 0. Path and workspace crates keep the plain executable,
    because cargo recompiles their build script whenever their sources change and their runs are not
-   the expensive ones. The per-unit entry stores the real binary (mode 0755) under the plain crate
-   name, the name v0.2 used, and never the shim; a restore writes the shim fresh, so it names the
-   blitz doing the restoring, and a v0.2 binary can still read a v0.3 entry.
+   the expensive ones. The per-unit entry stores the real binary (mode 0755) under the hashed
+   executable name cargo gave the script (`build_script_build-<meta>`), the name it had before the
+   shim replaced it and the name v0.2 stored, and never the shim; a restore writes the shim fresh, so
+   it names the blitz doing the restoring, and a v0.2 binary can still read a v0.3 entry.
 
 2. **Key** (domain `blitz-bsrun-v1`):
    - the BLAKE3 digest of the real executable (a recompile, a new compiler or a new linker changes it);

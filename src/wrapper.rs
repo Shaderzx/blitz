@@ -499,9 +499,9 @@ impl Ctx<'_> {
         };
         for (name, stamp) in scan_out_dir(self.out_dir, &prefixes) {
             // The shim carries this blitz's path and is written fresh on every restore, so it is not
-            // part of the entry. The real executable next to it is stored under the plain crate name,
-            // which is the name v0.2 used: an entry written here is still readable by a v0.2 binary,
-            // and a v0.2 entry restores correctly here.
+            // part of the entry. The real executable next to it is stored under the hashed name cargo
+            // gave the script (`build_script_build-<meta>`), the name it had before the shim replaced
+            // it and the name v0.2 stored: a v0.2 entry restores here, and this entry restores there.
             let stored_name = match (shimmed, name.strip_suffix(".blitz-real")) {
                 (true, Some(stem)) => stem.to_string(),
                 (true, None) if name == exe_name => continue,
