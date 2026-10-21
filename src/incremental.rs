@@ -257,26 +257,24 @@ impl Plan {
             .session_state()?
             .into_iter()
             .filter(|now| !before.contains(now))
+            .filter(|now| now.session.as_ref().is_some_and(|(_, mtime)| *mtime >= started))
             .collect();
         if changed.is_empty() {
             wrapper::log_decision("nosnap", &self.krate, "no-session");
             return Ok(None);
         }
-        if changed.len() > 1 {
-            // Two crate directories changed during one compile. Neither can be attributed to this
-            // invocation, and picking one would overwrite another crate's lineage with wrong state.
+        // The compiler that finished most recently wrote the newest session, and this invocation is
+        // the one that just exited: several targets of one crate compile together (a library and its
+        // test build share the incremental directory), so the newest is ours. Two sessions with the
+        // same timestamp cannot be told apart, and guessing would hand another target's state to
+        // this lineage.
+        changed.sort_by(|a, b| session_time(b).cmp(&session_time(a)));
+        if changed.len() > 1 && session_time(&changed[0]) == session_time(&changed[1]) {
             wrapper::log_decision("nosnap", &self.krate, "ambiguous");
             return Ok(None);
         }
         let state = changed.remove(0);
-        let Some((session, mtime)) = state.session else {
-            wrapper::log_decision("nosnap", &self.krate, "no-session");
-            return Ok(None);
-        };
-        if mtime < started {
-            wrapper::log_decision("nosnap", &self.krate, "session-not-from-this-compile");
-            return Ok(None);
-        }
+        let (session, _) = state.session.clone().expect("a changed state has a session");
         let crate_dir = state.dir;
         let mut files = Vec::new();
         let mut bytes = 0u64;
@@ -392,6 +390,11 @@ impl Plan {
 struct SessionState {
     dir: PathBuf,
     session: Option<(String, SystemTime)>,
+}
+
+/// The newest session's timestamp, or the epoch for a directory with no finalized session.
+fn session_time(state: &SessionState) -> SystemTime {
+    state.session.as_ref().map(|(_, mtime)| *mtime).unwrap_or(UNIX_EPOCH)
 }
 
 #[derive(Serialize, Deserialize)]
