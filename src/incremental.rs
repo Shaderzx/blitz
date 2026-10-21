@@ -28,6 +28,10 @@ use crate::wrapper::{self, Invocation};
 /// newest state for the next pull request.
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(300);
 
+/// How long a seed staging directory may sit in the incremental directory before a later seed treats
+/// it as the remains of a killed build and deletes it.
+const STALE_SEED_AGE: Duration = Duration::from_secs(3600);
+
 /// Runs an incremental compiler invocation with seeding before it and a snapshot after it.
 ///
 /// `wrapper` is the workspace wrapper cargo put in front of the compiler (`clippy-driver`), or
@@ -154,6 +158,7 @@ impl Plan {
             return Ok(None);
         }
         fs::create_dir_all(&self.dir)?;
+        self.remove_stale_seeds();
         let tmp = self
             .dir
             .join(format!(".blitz-seed-{}-{}", std::process::id(), unique()));
@@ -167,6 +172,30 @@ impl Plan {
                 let _ = fs::remove_dir_all(&tmp);
                 // Another process seeded the same crate first; its state is as good as ours.
                 if dest.exists() { Ok(None) } else { Err(e.into()) }
+            }
+        }
+    }
+
+    /// Removes seed staging directories a killed build left behind, so they do not accumulate in the
+    /// shared incremental directory. Only ones older than an hour: a concurrent build may be filling
+    /// its own right now.
+    fn remove_stale_seeds(&self) {
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(".blitz-seed-") {
+                continue;
+            }
+            let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+                continue;
+            };
+            let stale = SystemTime::now()
+                .duration_since(modified)
+                .is_ok_and(|age| age > STALE_SEED_AGE);
+            if stale {
+                let _ = fs::remove_dir_all(entry.path());
             }
         }
     }
@@ -186,6 +215,10 @@ impl Plan {
     /// Stores the newest finalized session this invocation wrote, plus its lock file.
     fn snapshot(&self, before: Option<Result<Vec<SessionState>>>, started: SystemTime) {
         if disabled() || !self.snapshot_due() {
+            return;
+        }
+        if self.store.writable_root().is_none() {
+            // Nothing can be stored, so a snapshot line would only report state that does not exist.
             return;
         }
         let before = match before {
