@@ -90,6 +90,26 @@ impl Plan {
         let manifest = std::env::var_os("CARGO_MANIFEST_DIR").context("no CARGO_MANIFEST_DIR")?;
         let manifest = Path::new(&manifest);
         k.part("manifest", normalizer.normalize(&manifest.to_string_lossy()).as_bytes());
+        // The normalizer maps every package's manifest directory to the same `$MANIFEST` token, so on
+        // its own it cannot tell two packages with the same crate name apart, and a bench or example
+        // target of one package would share a lineage with the library. Package name, version and the
+        // manifest's path inside the workspace keep them distinct without putting the checkout into
+        // the key.
+        k.part(
+            "pkg-name",
+            std::env::var("CARGO_PKG_NAME").unwrap_or_default().as_bytes(),
+        );
+        k.part(
+            "pkg-version",
+            std::env::var("CARGO_PKG_VERSION").unwrap_or_default().as_bytes(),
+        );
+        k.part(
+            "manifest-rel",
+            workspace_relative(manifest)
+                .as_deref()
+                .unwrap_or("<outside>")
+                .as_bytes(),
+        );
 
         Ok(Plan {
             store,
@@ -353,6 +373,25 @@ fn profile_name(out_dir: &Path) -> Result<String> {
             .context("no profile directory");
     }
     name(out_dir).context("no profile directory")
+}
+
+/// The manifest path relative to the nearest enclosing workspace root, when there is one. The root
+/// is the first ancestor whose `Cargo.toml` declares a `[workspace]` table; a package outside any
+/// workspace has none, and `<outside>` is recorded for it instead.
+fn workspace_relative(manifest: &Path) -> Option<String> {
+    for dir in manifest.ancestors() {
+        let Ok(text) = fs::read_to_string(dir.join("Cargo.toml")) else {
+            continue;
+        };
+        if !text.lines().any(|line| line.trim_start().starts_with("[workspace")) {
+            continue;
+        }
+        return manifest
+            .strip_prefix(dir)
+            .ok()
+            .map(|rel| rel.to_string_lossy().into_owned());
+    }
+    None
 }
 
 /// The lock file rustc keeps next to a session: its stem is the session's name without the
