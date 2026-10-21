@@ -152,4 +152,55 @@ second_out=$( cd "$broken" && "$blitz" build --offline 2>&1 ) || status=$?
 expect_miss "$second_out" "the second failing build"
 ok "a failing build exits 101 and is not cached"
 
+# 8. A file the ignore rules hide is still an input: the fixture reads a gitignored data file
+#    with include_str!, so editing it has to miss instead of restoring the old binary.
+ignored=$work/ignored
+copy_fixture "$ignored"
+( cd "$ignored" && git init -q . ) || fail "git init failed in the ignored-data fixture"
+build "$ignored" >/dev/null || fail "the build with a gitignored data file failed"
+out=$(build "$ignored") || fail "the second build with a gitignored data file failed: $out"
+expect_restored "$out" "the second build with a gitignored data file"
+printf 'fixture-data-two\n' >"$ignored/data/value.txt"
+out=$(build "$ignored") || fail "the build after editing the gitignored data file failed: $out"
+expect_miss "$out" "the build after editing the gitignored data file"
+expect_output "$ignored" debug fixture-value-one "the build after editing the gitignored data file"
+ok "editing a gitignored file read with include_str! misses"
+
+# 9. A build script that watches a directory: adding or editing a file inside it has to miss,
+#    and the directory is gitignored so only the recorded tree can see the change.
+watched=$work/watched
+copy_fixture "$watched"
+( cd "$watched" && git init -q . ) || fail "git init failed in the watched-directory fixture"
+mkdir -p "$watched/watched"
+printf 'one\n' >"$watched/watched/first.txt"
+build "$watched" >/dev/null || fail "the build with a watched directory failed"
+out=$(build "$watched") || fail "the second build with a watched directory failed: $out"
+expect_restored "$out" "the second build with a watched directory"
+printf 'two\n' >"$watched/watched/second.txt"
+out=$(build "$watched") || fail "the build after adding a file to the watched directory failed: $out"
+expect_miss "$out" "the build after adding a file to the watched directory"
+printf 'edited\n' >"$watched/watched/first.txt"
+out=$(build "$watched") || fail "the build after editing a file in the watched directory failed: $out"
+expect_miss "$out" "the build after editing a file in the watched directory"
+ok "adding or editing a file in a rerun-if-changed directory misses"
+
+# 10. A read-only tier answers a build without being written: prime a cache, then restore from it
+#     with an empty writable directory and BLITZ_READONLY=1, and compare the tier byte for byte.
+ro=$work/ro
+mkdir -p "$ro/prime" "$ro/empty"
+prime=$work/prime
+copy_fixture "$prime"
+( cd "$prime" && BLITZ_CACHE_DIR="$ro/prime" "$blitz" build --offline ) >/dev/null 2>&1 \
+  || fail "priming the read-only cache failed"
+before=$( cd "$ro/prime" && find . -type f | sort | xargs shasum | shasum )
+reader=$work/reader
+copy_fixture "$reader"
+out=$( cd "$reader" && BLITZ_CACHE_DIR="$ro/empty" BLITZ_CACHE_RO="$ro/prime" BLITZ_READONLY=1 \
+  "$blitz" build --offline 2>&1 ) || fail "the read-only restore failed: $out"
+expect_restored "$out" "the read-only restore"
+expect_output "$reader" debug fixture-value-one "the read-only restore"
+after=$( cd "$ro/prime" && find . -type f | sort | xargs shasum | shasum )
+[ "$before" = "$after" ] || fail "the read-only cache directory changed during the restore"
+ok "a read-only cache tier restores and stays unchanged"
+
 echo "all e2e checks passed"

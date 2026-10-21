@@ -159,6 +159,110 @@ pub fn walk(root: &Path, skip: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+/// Every input inside the workspace that an ignore rule hides from the ordinary [`walk`], found by
+/// following what the visible manifests declare: the workspace `members` and the `path`
+/// dependencies.
+///
+/// Cargo reads a vendored tree's manifests and sources even when `.gitignore` lists it, so a
+/// vendored package that nobody keys would let an edit to it hit a stale entry. Walking the whole
+/// tree with the ignore rules off would find them too, but it would also read every ignored
+/// `node_modules` on the hit path; following declarations only visits what cargo builds.
+///
+/// Globs in `members` are skipped: cargo expands them to directories the ordinary walk sees, and a
+/// glob that points into an ignored tree is rare enough to leave to a miss.
+pub fn hidden_manifests(root: &Path, walked: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let root_real = fs::canonicalize(root).unwrap_or_else(|_| normalize(root));
+    let mut covered: BTreeSet<PathBuf> = walked.iter().cloned().collect();
+    let mut extra: Vec<PathBuf> = Vec::new();
+
+    // The lock file is read by cargo even when an ignore rule hides it.
+    let lock = PathBuf::from("Cargo.lock");
+    if root.join(&lock).is_file() && covered.insert(lock.clone()) {
+        extra.push(lock);
+    }
+
+    let mut pending: Vec<PathBuf> = Vec::new();
+    for rel in walked {
+        if rel.file_name() == Some(OsStr::new("Cargo.toml")) {
+            if let Some(dir) = rel.parent() {
+                pending.push(root.join(dir));
+            }
+        }
+    }
+
+    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+    while let Some(dir) = pending.pop() {
+        let Ok(text) = fs::read_to_string(dir.join("Cargo.toml")) else {
+            continue;
+        };
+        let mut declared: Vec<PathBuf> = member_dirs(&text).into_iter().map(|m| dir.join(m)).collect();
+        declared.extend(path_values(&text).into_iter().map(|p| dir.join(p)));
+        for target in declared {
+            let real = fs::canonicalize(&target).unwrap_or_else(|_| normalize(&target));
+            if !real.starts_with(&root_real) || real == root_real || !real.join("Cargo.toml").is_file() {
+                // Outside the root is `external_packages`' job, the root itself is already walked,
+                // and anything else is not a package.
+                continue;
+            }
+            if !seen.insert(real.clone()) {
+                continue;
+            }
+            let Ok(rel_dir) = real.strip_prefix(&root_real) else {
+                continue;
+            };
+            if !covered.contains(&rel_dir.join("Cargo.toml")) {
+                for rel in walk(&real, &real.join("target"))? {
+                    let path = rel_dir.join(rel);
+                    if covered.insert(path.clone()) {
+                        extra.push(path);
+                    }
+                }
+            }
+            pending.push(real);
+        }
+    }
+    extra.sort();
+    Ok(extra)
+}
+
+/// The literal directories in a manifest's `[workspace] members` list, ignoring globs.
+fn member_dirs(text: &str) -> Vec<String> {
+    let Some(start) = text.find("members") else {
+        return Vec::new();
+    };
+    let rest = &text[start..];
+    let Some(open) = rest.find('[') else {
+        return Vec::new();
+    };
+    let Some(end) = rest[open..].find(']') else {
+        return Vec::new();
+    };
+    quoted_values(&rest[open + 1..open + end])
+        .into_iter()
+        .filter(|value| !value.contains(['*', '?', '[']))
+        .collect()
+}
+
+/// Every quoted string in `text`, in order.
+fn quoted_values(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '"' && c != '\'' {
+            continue;
+        }
+        let mut value = String::new();
+        for next in chars.by_ref() {
+            if next == c {
+                out.push(std::mem::take(&mut value));
+                break;
+            }
+            value.push(next);
+        }
+    }
+    out
+}
+
 /// Removes `.` and `..` lexically, for comparing paths that do not exist yet. It never touches the
 /// filesystem, so a symlinked `..` can differ from the real path; callers canonicalize first when
 /// the path exists.
