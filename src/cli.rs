@@ -21,6 +21,7 @@ ENVIRONMENT:
     BLITZ_CACHE_DIR   writable cache directory (default ~/.cache/blitz)
     BLITZ_CACHE_RO    extra read-only cache directories, separated by ':'
     BLITZ_READONLY=1  never write to the cache
+    BLITZ_VERIFY=1    re-hash every restored blob and drop the ones that do not match
     BLITZ_DISABLE=1   run plain cargo, no caching
     BLITZ_LOG=<file>  append a line per cache decision to <file>
 ";

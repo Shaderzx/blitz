@@ -20,6 +20,11 @@ use std::ffi::OsString;
 
 fn main() {
     let args: Vec<OsString> = std::env::args_os().collect();
+    // Cargo runs `$RUSTC_WRAPPER $RUSTC_WORKSPACE_WRAPPER $RUSTC <args...>` when both wrappers are
+    // set, so the first argument can be another wrapper that blitz must simply run.
+    if let Some(code) = wrapper::chained(&args[1..]) {
+        std::process::exit(code);
+    }
     // Cargo runs `$RUSTC_WRAPPER <path to rustc> <rustc args...>`.
     if args.len() >= 2 && wrapper::looks_like_compiler(&args[1]) {
         std::process::exit(wrapper::main(&args[1], &args[2..]));

@@ -110,7 +110,8 @@ build because of the cache: any internal error runs the real compiler with the o
    incremental=...` is present; the compiler is `clippy-driver` or anything other than a plain
    rustc; crate types include `bin`, `dylib` or `cdylib` (linking pulls in system state); `--emit`
    lacks both `link` and `metadata`; `BLITZ_DISABLE=1`.
-   Cacheable crate types: `lib`, `rlib`, `staticlib`, `proc-macro`.
+   Cacheable crate types: `lib`, `rlib`, `proc-macro`. A proc-macro is a linked artifact, so its key
+   also covers the linker binary and the SDK variables (decision 13 in `docs/decision-trail.md`).
 2. Key (domain `blitz-unit-v1`):
    - `rustc_identity(<rustc>)` (argv[1] is the real toolchain binary; cache by its metadata).
    - The arguments in order, each normalized: replace the out-dir's target root (the directory two
@@ -121,15 +122,16 @@ build because of the cache: any internal error runs the real compiler with the o
      `<target root>/blitz/digests/<file name>` (size + mtime ns + digest) so each rlib is hashed once.
    - Environment: every `CARGO_*` variable cargo set for this invocation except `CARGO_MAKEFLAGS`
      and `CARGO_HOME`, normalized the same way; plus `RUSTC_BOOTSTRAP`, `OUT_DIR` (normalized),
-     `SDKROOT`, `MACOSX_DEPLOYMENT_TARGET`.
+     `SDKROOT`, `DEVELOPER_DIR`, `MACOSX_DEPLOYMENT_TARGET`, and every `DEP_*` variable cargo set for
+     the unit (the `links` metadata of its dependencies).
    - Sources:
-     - When `CARGO_MANIFEST_DIR` is inside `$CARGO_HOME/registry/src` or `$CARGO_HOME/git/checkouts`,
-       the sources are immutable for a given normalized path (crates.io and git revisions do not
-       change), so skip the dep-info pre-pass and key on the normalized manifest dir alone.
-     - Otherwise run a dep-info pre-pass: the same arguments with `--emit` replaced by
-       `--emit=dep-info`, `-o`/`--out-dir` pointed at a temp directory, and diagnostics discarded.
-       Parse the `.d` file: hash every prerequisite file (path normalized in the key) and record
-       `# env-dep:NAME=VALUE` lines (key on NAME and the current value).
+     - Every unit gets a dep-info pre-pass, because that is where the `# env-dep:` lines come from
+       (see the next bullet). When `CARGO_MANIFEST_DIR` is an unpacked registry crate, that is under
+       `$CARGO_HOME/registry/src` with a `.cargo-ok` file next to its `Cargo.toml`, its source files
+       are not hashed: an extraction cannot change and `Cargo.lock` pins the version. A git checkout
+       is not treated that way; its sources are hashed like a local crate's.
+     - Otherwise the pre-pass hashes every prerequisite file (path normalized in the key), and in
+       both cases the `# env-dep:NAME=VALUE` lines it reported are keyed by name and current value.
      - When `OUT_DIR` is set (the crate has a build script), hash every file under `OUT_DIR`
        (relative paths). Generated sources and bundled native libraries live there.
 3. Hit: entry `unit/<key>` lists output files (file name, digest), the normalized stdout and

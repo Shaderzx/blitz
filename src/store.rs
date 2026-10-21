@@ -15,7 +15,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -108,6 +108,11 @@ impl Store {
 
     /// Writes blob `d` to `dest`: copied (cloned on APFS, btrfs, XFS) to a temporary file next to
     /// `dest`, given `mode` and a fresh mtime, then renamed over `dest`. Readers never see a partial file.
+    ///
+    /// With `BLITZ_VERIFY=1` the copy is re-hashed before it is published: a blob that does not match
+    /// its name is deleted from a tier this process may write and reported as an error, which every
+    /// caller turns into a miss. Verification is off by default because a blob only ever appears by
+    /// atomic rename, and hashing a 100 MB binary costs more than the rest of the hit path.
     pub fn materialize(&self, d: &Digest, dest: &Path, mode: u32) -> Result<()> {
         let src = self
             .find_blob(d)
@@ -116,6 +121,14 @@ impl Store {
         fs::create_dir_all(dir)?;
         let tmp = dir.join(format!(".blitz-{}-{}", std::process::id(), unique()));
         fs::copy(&src, &tmp).with_context(|| format!("restoring {}", dest.display()))?;
+        if verify_on() && Digest::of_file(&tmp)? != *d {
+            let _ = fs::remove_file(&tmp);
+            // A corrupt blob is worse than no blob: drop it where this process may write.
+            if self.writable_root().is_some_and(|root| src.starts_with(root)) {
+                let _ = fs::remove_file(&src);
+            }
+            bail!("blob {} does not match its digest", d.short());
+        }
         set_mode(&tmp, mode)?;
         fs::File::options()
             .write(true)
@@ -159,6 +172,11 @@ impl Store {
             let _ = f.write_all(format!("{secs} {event} {detail}\n").as_bytes());
         }
     }
+}
+
+/// `BLITZ_VERIFY=1` re-hashes every restored blob. Off by default; see `Store::materialize`.
+fn verify_on() -> bool {
+    std::env::var("BLITZ_VERIFY").is_ok_and(|v| v == "1")
 }
 
 fn default_cache_dir() -> Option<PathBuf> {

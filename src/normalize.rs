@@ -50,9 +50,7 @@ impl Normalizer {
     pub fn normalize(&self, text: &str) -> String {
         let mut out = text.to_string();
         for (real, placeholder) in &self.roots {
-            if out.contains(real.as_str()) {
-                out = out.replace(real.as_str(), placeholder);
-            }
+            out = replace_at_boundary(&out, real, placeholder);
         }
         out
     }
@@ -60,11 +58,38 @@ impl Normalizer {
     pub fn denormalize(&self, text: &str) -> String {
         let mut out = text.to_string();
         for (placeholder, real) in &self.preferred {
-            if out.contains(placeholder) {
-                out = out.replace(placeholder, real);
-            }
+            out = replace_at_boundary(&out, placeholder, real);
         }
         out
+    }
+}
+
+/// Replaces every occurrence of `from` that ends at a path boundary. A root only names a directory:
+/// rewriting it inside a longer name would invent a path that was never there, so `/w/target-old`
+/// keeps its name under a root of `/w/target` while `/w/target/debug` becomes `$TARGET/debug`.
+fn replace_at_boundary(text: &str, from: &str, to: &str) -> String {
+    if from.is_empty() || !text.contains(from) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(from) {
+        let after = &rest[i + from.len()..];
+        out.push_str(&rest[..i]);
+        out.push_str(if ends_segment(after) { to } else { from });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// True when `after` begins a new path segment: nothing at all, a separator, or a character that no
+/// file name contains (a space, a quote, a colon in a dep-info rule).
+fn ends_segment(after: &str) -> bool {
+    match after.chars().next() {
+        None => true,
+        Some(c) if c == '/' || c == '\\' => true,
+        Some(c) => !(c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '+' | '~' | '@')),
     }
 }
 
