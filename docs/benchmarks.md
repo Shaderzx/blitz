@@ -123,13 +123,19 @@ compare each row with `cargo cold` from its own table as well as the absolute se
 | cargo no-op | 0.114 | | 1.00x |
 | blitz no-op | 0.011 | | 9.92x |
 
-`blitz warm + edit` fell from 28.523 s to 24.604 s, and from 86% of that run's cold build to
-70%. The gain is bounded by rustc: it discards an incremental session whose command line
-differs, and a fresh checkout spells `--out-dir`, `-L` and the source paths differently, so
-little of another checkout's session is reused. Seeding the same tree is where the feature
-pays: on a checkout that had built once, deleting the incremental state and editing one
-library line rebuilt in 17.0 s without seeding and 2.3 s with a snapshot taken from that
-same compiled state.
+`blitz warm + edit` fell from 28.523 s to 24.604 s across checkouts, but those medians overlap:
+before [33.818, 24.787, 28.523] s, after [25.244, 24.604, 24.364] s, on a shared machine under
+load. That row cannot separate seeding from noise, and it is not the evidence for the feature.
+
+The evidence is the same path, measured on the CI host (fm-hel-03-ai, 64 cores, Docker, CI paths
+`/src` and `/target`, `CARGO_BUILD_JOBS=4`, engine `cargo test --no-run`, empty target after a
+one-line edit): seeding off 79.4 s, seeding on 27.3 s, and 24.5 s with line-tables-only debug
+info. On that host plain cargo cold is 136.8 s, blitz cold 139.6 s and line-tables-only cold
+120.6 s. A fresh checkout reuses little, because rustc discards a session whose command line
+differs and another checkout spells `--out-dir`, `-L` and the source paths differently; the same
+tree does, which is the case CI has after its first build and on every branch switch in one
+working copy. On a local checkout that had built once, deleting the incremental state and editing
+one library line rebuilt in 17.0 s without seeding and 2.3 s with a snapshot from that same state.
 
 Build scripts: on a fresh checkout of the same revision, 313 of 318 units came from the cache
 (35 build-script units used to miss every time). The snapshot cost measured during that
