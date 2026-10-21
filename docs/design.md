@@ -120,7 +120,8 @@ build because of the cache: any internal error runs the real compiler with the o
 
 1. Pass straight through (no caching) when: no `--crate-name`; any input is `-` (stdin); `-C
    incremental=...` is present (those invocations are seeded instead, see the next section); the
-   compiler is `clippy-driver` or anything other than a plain rustc; crate types include `bin`,
+   real compiler is not a plain `rustc` (`clippy-driver` reaches it as a chained wrapper, and the
+   units behind it are cached like any other); crate types include `bin`,
    `dylib` or `cdylib` (linking pulls in system state); `--emit` lacks both `link` and `metadata`;
    `BLITZ_DISABLE=1`.
    Cacheable crate types: `lib`, `rlib`, `proc-macro`, and `bin` for a build script
@@ -190,8 +191,10 @@ behind a workspace wrapper such as `clippy-driver`, takes this path:
 1. **Lineage key** (domain `blitz-incr-v1`): the real compiler's `rustc -vV` text
    (`toolchain::rustc_identity`), the chained driver's path, size and mtime when there is one, the
    crate name, crate types, whether `--test` is present, `--target`, the profile directory name
-   (`debug`, `release`), and the normalized `CARGO_MANIFEST_DIR`. The sources, the `--extern`
-   digests and `-C metadata` are deliberately left out: they change between commits, and reusing
+   (`debug`, `release`), and the normalized `CARGO_MANIFEST_DIR`, the package name and version, and
+   the manifest's path relative to the workspace root, so two packages with one crate name (or one
+   package's library and its bench) never share a lineage. The sources, the `--extern` digests and
+   `-C metadata` are deliberately left out: they change between commits, and reusing
    older state across them is the point.
 2. **Seed** before the compiler runs: look up `incr/<lineage>`. The entry records the crate's
    incremental subdirectory (`<crate_name>-<id>`, one plain path component, rejected otherwise)
@@ -201,12 +204,17 @@ behind a workspace wrapper such as `clippy-driver`, takes this path:
    session's lock, whose name is the session name without its trailing hash component. rustc does
    not load a session whose lock is missing, so an entry without one is not used. Log `seed` or
    `noseed`; any error skips seeding and never fails the build.
-3. **Snapshot** after the compiler exits 0: find the `<crate_name>-*` directory whose newest
-   finalized `s-*` session (not `-working`) was modified at or after the invocation started, choose
-   that newest session, and store its files plus its lock. The blobs are written from the digest
+3. **Snapshot** after the compiler exits 0: every `<crate_name>-*` directory and its newest finalized
+   `s-*` session (not `-working`) were recorded before the compile, so the one directory whose
+   session changed during it is the crate directory this invocation wrote; that newest session's
+   files plus its lock are stored. Two directories changing at once cannot be attributed, so the
+   snapshot is skipped (`nosnap ambiguous`). The blobs are written from the digest
    memo, so unchanged object files are not re-hashed. A lineage snapshotted less than five minutes
-   ago is left alone unless `BLITZ_INCREMENTAL_SNAPSHOT=always`, which CI sets so every run leaves
-   the newest state for the next pull request. Log the file count, byte count and duration.
+   ago is left alone unless `BLITZ_INCREMENTAL_SNAPSHOT=always`, which adopting CI sets (the
+   FlowMaster repos do), so every run leaves the newest state for the next pull request. Log the file
+   count, byte count and duration, and log `nosnap <reason>` when a snapshot is skipped. Staging
+   directories a killed build left behind (`.blitz-seed-*` older than an hour) are deleted when the
+   next seed runs.
 4. `BLITZ_INCREMENTAL=off` disables seeding and snapshots.
 
 ## Correctness rules
