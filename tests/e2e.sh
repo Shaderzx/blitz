@@ -68,10 +68,19 @@ expect_miss() {
 }
 
 expect_output() {
-  # expect_output <dir> <profile> <expected> <label>
+  # expect_output <dir> <profile> <expected first line> <label>
   local out
   out=$("$1/target/$2/app") || fail "$4: the built binary did not run"
-  [ "$out" = "$3" ] || fail "$4: the binary printed '$out', expected '$3'"
+  [ "${out%%$'\n'*}" = "$3" ] || fail "$4: the binary printed '${out%%$'\n'*}' as its first line, expected '$3'"
+}
+
+expect_line() {
+  # expect_line <dir> <profile> <line number> <expected> <label>
+  local out
+  out=$("$1/target/$2/app") || fail "$5: the built binary did not run"
+  local got
+  got=$(printf '%s\n' "$out" | sed -n "${3}p")
+  [ "$got" = "$4" ] || fail "$5: line $3 of the binary output is '$got', expected '$4'"
 }
 
 # 1. A fresh checkout with an empty cache builds the workspace and runs.
@@ -164,7 +173,8 @@ printf 'fixture-data-two\n' >"$ignored/data/value.txt"
 out=$(build "$ignored") || fail "the build after editing the gitignored data file failed: $out"
 expect_miss "$out" "the build after editing the gitignored data file"
 expect_output "$ignored" debug fixture-value-one "the build after editing the gitignored data file"
-ok "editing a gitignored file read with include_str! misses"
+expect_line "$ignored" debug 2 "data:fixture-data-two" "the build after editing the gitignored data file"
+ok "editing a gitignored file read with include_str! misses and the rebuilt binary prints the new value"
 
 # 9. A build script that watches a directory: adding or editing a file inside it has to miss,
 #    and the directory is gitignored so only the recorded tree can see the change.
@@ -176,13 +186,21 @@ printf 'one\n' >"$watched/watched/first.txt"
 build "$watched" >/dev/null || fail "the build with a watched directory failed"
 out=$(build "$watched") || fail "the second build with a watched directory failed: $out"
 expect_restored "$out" "the second build with a watched directory"
+expect_line "$watched" debug 3 "watched:first.txt" "the second build with a watched directory"
 printf 'two\n' >"$watched/watched/second.txt"
 out=$(build "$watched") || fail "the build after adding a file to the watched directory failed: $out"
 expect_miss "$out" "the build after adding a file to the watched directory"
+expect_line "$watched" debug 3 "watched:first.txt,second.txt" "the build after adding a file to the watched directory"
+# An empty directory has no file digest of its own, so only a recorded directory entry can see it.
+mkdir "$watched/watched/emptydir"
+out=$(build "$watched") || fail "the build after adding an empty directory failed: $out"
+expect_miss "$out" "the build after adding an empty directory"
+expect_line "$watched" debug 3 "watched:emptydir,first.txt,second.txt" "the build after adding an empty directory"
 printf 'edited\n' >"$watched/watched/first.txt"
 out=$(build "$watched") || fail "the build after editing a file in the watched directory failed: $out"
 expect_miss "$out" "the build after editing a file in the watched directory"
-ok "adding or editing a file in a rerun-if-changed directory misses"
+expect_line "$watched" debug 3 "watched:emptydir,first.txt,second.txt" "the build after editing a file in the watched directory"
+ok "adding a file, an empty directory or an edit in a rerun-if-changed directory misses"
 
 # 10. A read-only tier answers a build without being written: prime a cache, then restore from it
 #     with an empty writable directory and BLITZ_READONLY=1, and compare the tier byte for byte.

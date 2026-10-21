@@ -44,10 +44,18 @@ without spawning rustup in the common case.
    nearest `Cargo.toml` (respecting `--manifest-path`).
 3. Compute the key (domain `blitz-whole-v1`) from:
    - every input file under the workspace root: walk with the `ignore` crate (respects `.gitignore`,
-     includes hidden files such as `.cargo/config.toml`, skips `.git/` and the target directory).
+     includes hidden files such as `.cargo/config.toml`, skips `.git/`, the target directory and
+     every cache store root, which may sit inside the workspace).
      Each file contributes its path relative to the root and its BLAKE3 digest. A stat cache
      (`<target>/blitz/statcache.json`: relative path -> size, mtime ns, inode, digest) avoids
-     re-hashing unchanged files; any metadata change means re-hash.
+     re-hashing unchanged files; any metadata change means re-hash, and a file whose mtime is within
+     2 s of now is re-hashed anyway (the racy-clean rule: a rewrite inside one clock tick moves no
+     stat field).
+   - a second walk with the ignore rules switched off adds every `Cargo.toml` and `Cargo.lock`
+     under the root, so a member an ignore rule hides (for example `members = ["vendor/*"]` with
+     `vendor/` in `.gitignore`) is still keyed. It skips `.git`, the target directory and the cache
+     store roots, collects only those two file names, and skips a manifest it cannot read rather
+     than failing the key.
    - `~/.cargo/config.toml` (or `$CARGO_HOME/config.toml`) contents if present.
    - toolchain: `rustc_identity(resolve_rustc(root))`, plus size and mtime of the `cargo` binary next
      to that rustc.
@@ -78,12 +86,16 @@ without spawning rustup in the common case.
    workspace itself (labelled by the manifest's path value, so no absolute path enters the key).
    Any dep-info prerequisite or `rerun-if-changed` path the key does not already hold is an extra
    input, including git-ignored files under the root; those are stored relative to the root so a
-   second checkout validates its own copy. A watched directory is recorded as its sorted tree
-   (relative path and digest per file). `NotFound` is the only "absent"; any other read error
-   means no entry is stored. `Cargo.lock` and every manifest reachable through `members` and
-   `path` dependencies are keyed even when git-ignored. File-valued `--config` falls back to plain
-   cargo (inline `key=value` is keyed as a string). Entries carry `ENTRY_VERSION` 2, so entries
-   from before these rules are never reused.
+   second checkout validates its own copy. A watched directory is recorded as its sorted tree, one
+   digest per file and a digest-free entry per directory, so adding, removing or renaming an empty
+   directory changes the value. The target directory and every cache store root are left out of the
+   tree, and a watch that resolves exactly at one of them stores no entry at all: its tree changes
+   with every build. `NotFound` is the only "absent"; any other read error
+   means no entry is stored. Every `Cargo.toml` and `Cargo.lock` under the root is keyed even when
+   git-ignored. File-valued `--config` falls back to plain
+   cargo (inline `key=value` is keyed as a string). Entries carry `ENTRY_VERSION` 3, so entries
+   from before these rules are never reused. A build that starts without a `Cargo.lock` stores no
+   entry: cargo writes the lock during that build, so the recorded key could never be looked up.
    On a hit, every artifact path must be relative with only normal components; anything else is
    treated as a miss before a single file is written.
    The sources of extra inputs:
