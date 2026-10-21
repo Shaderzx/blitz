@@ -297,14 +297,27 @@ impl Ctx {
             return Ok(None);
         }
         // Cargo parses these bytes; they are replayed exactly as recorded, on the same streams.
+        if let Err(e) = self.replay(&entry) {
+            // The restore had already written a run this caller is about to repeat, so put OUT_DIR
+            // back the way cargo made it: a script that starts on its own previous output can fail
+            // where it would have succeeded.
+            let _ = fs::remove_dir_all(&self.out_dir);
+            let _ = fs::create_dir_all(&self.out_dir);
+            return Err(e.into());
+        }
+        Ok(Some(()))
+    }
+
+    /// Replays the recorded streams. Cargo parses stdout, so it goes out first and byte for byte;
+    /// stderr follows. A failed write is the caller's to empty OUT_DIR over.
+    fn replay(&self, entry: &BsEntry) -> std::io::Result<()> {
         let mut stdout = std::io::stdout().lock();
         stdout.write_all(entry.stdout.as_bytes())?;
         stdout.flush()?;
         drop(stdout);
         let mut stderr = std::io::stderr().lock();
         stderr.write_all(entry.stderr.as_bytes())?;
-        stderr.flush()?;
-        Ok(Some(()))
+        stderr.flush()
     }
 
     /// A directory has no blob, and a symlink's digest describes the file it resolved to, which is
