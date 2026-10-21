@@ -86,13 +86,13 @@ without spawning rustup in the common case.
    from before these rules are never reused.
    On a hit, every artifact path must be relative with only normal components; anything else is
    treated as a miss before a single file is written.
-   - files listed in the workspace crates' dep-info (`<target>/<profile>/deps/*.d`; parse the first
-     rule's prerequisites, paths canonicalised first) that are outside the workspace root and outside
-     `$CARGO_HOME/registry` and `$CARGO_HOME/git` (registry and git sources are pinned by
-     `Cargo.lock`), with their digests;
-   - for every build script output (`<target>/<profile>/build/*/output` written in this build):
-     `cargo:rerun-if-env-changed=NAME` (record NAME and its current value, or absent) and
-     `cargo:rerun-if-changed=PATH` outside the workspace (record path and digest).
+   The sources of extra inputs:
+   - every prerequisite in the workspace crates' dep-info (`<target>/<profile>/deps/*.d`, paths
+     canonicalised first) that the key does not already hold, except files under
+     `$CARGO_HOME/registry` and `$CARGO_HOME/git` (pinned by `Cargo.lock`);
+   - every build script output (`<target>/<profile>/build/*/output`): `cargo:rerun-if-env-changed=NAME`
+     (NAME and its current value, or absent) and `cargo:rerun-if-changed=PATH` (file digest, or the
+     directory's tree) when the key does not already hold it.
    Store the artifacts as blobs, then the entry, then write the stat cache.
 7. The target directory: `--target-dir` argument, else `CARGO_TARGET_DIR`, else `build.target-dir`
    in `<root>/.cargo/config.toml`, else `<root>/target`. Artifact paths are recorded relative to it,
