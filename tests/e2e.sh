@@ -275,6 +275,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/lib.rs");
     let out = std::env::var("OUT_DIR").expect("OUT_DIR is set for a build script");
     fs::write(format!("{out}/value.txt"), "build-script-value").expect("write the build script output");
+    // An empty directory has no file to carry it back from the cache.
+    fs::create_dir(format!("{out}/emptydir")).expect("create the empty directory");
 }
 EOF
 cat >"$bsrun_dep/src/lib.rs" <<'EOF'
@@ -320,6 +322,8 @@ rm -rf "$bsrun/target"
   || fail "the second registry build-script build failed"
 grep -qE '^bsrun-hit[[:space:]]' "$bsrun_log" \
   || fail "no bsrun-hit line in BLITZ_LOG: $(tr '\n' ' ' <"$bsrun_log")"
+find "$bsrun/target/debug/build" -type d -name emptydir | grep -q . \
+  || fail "the restored OUT_DIR is missing the empty directory the build script created"
 second_value=$("$bsrun/target/debug/app") || fail "the restored registry build-script binary did not run"
 [ "$second_value" = "$first_value" ] \
   || fail "the restored build printed '$second_value', expected '$first_value'"

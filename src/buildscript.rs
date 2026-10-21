@@ -317,6 +317,10 @@ impl Ctx {
         fs::create_dir_all(&self.out_dir)?;
         for file in &entry.files {
             let dest = self.out_dir.join(&file.name);
+            if file.dir {
+                fs::create_dir_all(&dest)?;
+                continue;
+            }
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -446,8 +450,18 @@ impl Ctx {
                     digest,
                     mode: mode_of(&meta),
                     link: Some(target),
+                    dir: false,
                 });
             } else if meta.is_dir() {
+                // An empty directory has no file to carry it, so it needs an entry of its own; without
+                // one, a restored OUT_DIR is missing a tree the real run created.
+                files.push(BsFile {
+                    name,
+                    digest: None,
+                    mode: mode_of(&meta),
+                    link: None,
+                    dir: true,
+                });
                 self.collect(&path, files, bytes)?;
             } else if meta.is_file() {
                 *bytes += meta.len();
@@ -457,6 +471,7 @@ impl Ctx {
                     digest: Some(digest),
                     mode: mode_of(&meta),
                     link: None,
+                    dir: false,
                 });
             } else {
                 bail!("special file in OUT_DIR");
@@ -537,12 +552,16 @@ struct BsFile {
     /// Path relative to OUT_DIR, with plain components only.
     name: String,
     /// The file's bytes, or for a symlink the digest of what it resolved to. `None` for a dangling
-    /// link, which is restored as a link and verifies nothing.
+    /// link, which is restored as a link and verifies nothing, and for a directory.
     digest: Option<Digest>,
     #[serde(default = "default_mode")]
     mode: u32,
     #[serde(default)]
     link: Option<String>,
+    /// A directory to recreate rather than a file to write. Directories are entries of their own so
+    /// that an empty one survives the round trip.
+    #[serde(default)]
+    dir: bool,
 }
 
 #[derive(Serialize, Deserialize)]

@@ -242,9 +242,10 @@ crate that builds C in its build script that run dominates: on engine's CI build
 
 4. **Hit.** Only into an empty or missing `OUT_DIR`; anything already there belongs to this run, so the
    real script runs instead. Files are materialized with their recorded modes, directories are
-   recreated, symlinks are recreated with their targets (a link that resolves to a file is stored with
-   the digest of that target and verified on every lookup; a link to a directory or a special file
-   makes the run uncacheable). An entry with an absolute name or a `..` refuses the hit. Cargo parses
+   recreated from entries of their own (an empty one has no file to carry it), and symlinks are
+   recreated with their targets: a link that resolves to a file is stored with the digest of that
+   target and verified on every lookup, and a link to a directory or a special file makes the run
+   uncacheable. An entry with an absolute name or a `..` refuses the hit. Cargo parses
    the recorded stdout, so it is replayed byte for byte, with the recorded stderr after it. A restore
    that fails halfway removes `OUT_DIR` again, so the real script starts from the empty directory cargo
    gave it.
