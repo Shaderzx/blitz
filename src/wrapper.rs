@@ -7,9 +7,12 @@
 //!
 //! The key covers the compiler identity, every argument (with checkout-specific paths replaced by
 //! placeholders), the contents of every `--extern` library, the environment cargo set for the unit,
-//! and the sources the unit reads. Every unit gets a `.d` pre-pass, because that is where rustc
-//! records which environment variables the unit read. An unpacked registry crate additionally skips
-//! hashing its sources: crates.io extractions cannot change, and `Cargo.lock` pins the version.
+//! and the sources the unit reads. A local or git unit gets a `.d` pre-pass, because that is where
+//! rustc records which environment variables the unit read, and the key depends on what it says.
+//! An unpacked registry crate skips both the pre-pass and the hashing of its sources: crates.io
+//! extractions cannot change, and `Cargo.lock` pins the version. Its environment reads are recorded
+//! in the entry from the `.d` the real compile writes and compared on every lookup, as ccache's
+//! direct mode does, so a cold registry unit costs one compiler process instead of two.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
@@ -196,6 +199,11 @@ fn run(rustc: &OsStr, args: &[OsString]) -> Result<Outcome> {
 
     let store = Store::from_env()?;
     let normalizer = build_normalizer(&target_root);
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
+    let registry = manifest
+        .as_deref()
+        .zip(cargo_home().as_deref())
+        .is_some_and(|(manifest, home)| registry_extraction(manifest, home));
     let ctx = Ctx {
         store: &store,
         normalizer: &normalizer,
@@ -203,6 +211,8 @@ fn run(rustc: &OsStr, args: &[OsString]) -> Result<Outcome> {
         out_dir: &out_dir,
         krate: &krate,
         extra_filename: &inv.extra_filename,
+        manifest: manifest.as_deref(),
+        registry,
     };
 
     let Some(key) = ctx.key(rustc, args, &inv)? else {
@@ -227,6 +237,10 @@ struct Ctx<'a> {
     out_dir: &'a Path,
     krate: &'a str,
     extra_filename: &'a str,
+    manifest: Option<&'a Path>,
+    /// True for an unpacked registry crate, whose sources and environment reads are keyed without a
+    /// pre-pass (see `Ctx::sources`).
+    registry: bool,
 }
 
 impl Ctx<'_> {
@@ -234,7 +248,7 @@ impl Ctx<'_> {
     /// uncached rather than risk a stale hit).
     fn key(&self, rustc: &OsStr, args: &[OsString], inv: &Invocation) -> Result<Option<Digest>> {
         let cache_root = self.store.writable_root().map(Path::to_path_buf);
-        let mut k = KeyBuilder::new("blitz-unit-v1");
+        let mut k = KeyBuilder::new("blitz-unit-v2");
         k.digest(
             "rustc",
             &toolchain::rustc_digest(Path::new(rustc), cache_root.as_deref())?,
@@ -275,36 +289,37 @@ impl Ctx<'_> {
         Ok(Some(k.finish()))
     }
 
-    /// Keys the sources. `None` means the pre-pass failed, so the unit is not cacheable this time.
+    /// Keys the sources. `None` means the inputs cannot be established, so the unit is not cacheable
+    /// this time.
     ///
-    /// The pre-pass runs for every unit, registry extractions included: its `# env-dep:` lines are
-    /// the only record of which environment variables the unit read, and a crate that reads one
-    /// produces different bytes when its value changes. Only the hashing of the source files is
-    /// skipped for a registry extraction.
+    /// A registry extraction stops at the normalized manifest path: the extraction cannot change for
+    /// a given path and `Cargo.lock` pins its version, so neither the pre-pass nor the source files
+    /// earn their place in the key. What it read from the environment is checked against the entry
+    /// instead (see `Ctx::env_deps_match`), and refreshed by every miss. Local and git units keep the
+    /// pre-pass: their sources can change, so a changed `# env-dep:` line has to change the key
+    /// before anything can be restored.
     fn sources(&self, k: &mut KeyBuilder, rustc: &OsStr, args: &[OsString]) -> Result<Option<()>> {
-        let Some(manifest) = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from) else {
+        let Some(manifest) = self.manifest else {
             return Ok(None);
         };
-        let Some(cargo_home) = cargo_home() else {
-            return Ok(None);
-        };
-        let dir = self.prepass_dir();
-        let info = dep_info(rustc, args, &dir);
-        let _ = fs::remove_dir_all(&dir);
-        let Some(info) = info else {
-            return Ok(None);
-        };
-        let registry = registry_extraction(&manifest, &cargo_home);
-        k.part("sources", if registry { b"registry" } else { b"dep-info" });
         // The normalized manifest names the crate for a registry extraction ($CARGO_HOME/registry/...)
         // and is a constant for a local one; either way it is recorded before the sources.
         k.part(
             "manifest",
             self.normalizer.normalize(&manifest.to_string_lossy()).as_bytes(),
         );
-        if !registry {
-            self.key_prerequisites(k, info.prerequisites)?;
+        if self.registry {
+            k.part("sources", b"registry");
+            return Ok(Some(()));
         }
+        let dir = self.prepass_dir();
+        let info = dep_info(rustc, args, &dir);
+        let _ = fs::remove_dir_all(&dir);
+        let Some(info) = info else {
+            return Ok(None);
+        };
+        k.part("sources", b"dep-info");
+        self.key_prerequisites(k, info.prerequisites)?;
         let mut env_deps = info.env_deps;
         env_deps.sort();
         for (name, value) in env_deps {
@@ -354,6 +369,12 @@ impl Ctx<'_> {
         let Some(entry) = self.store.get_entry::<UnitEntry>("unit", key) else {
             return Ok(false);
         };
+        if !self.env_deps_match(&entry.env_deps) {
+            // The environment this unit read has moved since the compile that filled the entry. The
+            // recompile stores the entry again with the values it saw, so the next lookup compares
+            // against those.
+            return Ok(false);
+        }
         let prefixes = self.output_prefixes();
         if !entry.outputs.iter().all(|o| output_name_ok(&o.name, &prefixes)) {
             // An entry is JSON read off the disk, not a promise: a name that is not one plain file
@@ -365,20 +386,36 @@ impl Ctx<'_> {
         }
         for output in &entry.outputs {
             let dest = self.out_dir.join(&output.name);
-            if is_dep_info(&output.name) {
+            let on_disk = if is_dep_info(&output.name) {
                 // The stored `.d` carries placeholders; only the restored copy may name real paths.
                 let text = String::from_utf8_lossy(&self.store.read_blob(&output.digest)?).into_owned();
-                write_atomic(&dest, self.normalizer.denormalize(&text).as_bytes(), output.mode)?;
+                let bytes = self.normalizer.denormalize(&text).into_bytes();
+                write_atomic(&dest, &bytes, output.mode)?;
+                // The memo has to describe the bytes on disk, which are not the stored text.
+                Digest::of_bytes(&bytes)
             } else {
                 self.store.materialize(&output.digest, &dest, output.mode)?;
-            }
-            remember_digest(self.target_root, &dest, &output.digest);
+                output.digest
+            };
+            remember_digest(self.target_root, &dest, &on_disk);
         }
         replay(
             &self.normalizer.denormalize(&entry.stdout),
             &self.normalizer.denormalize(&entry.stderr),
         )?;
         Ok(true)
+    }
+
+    /// True when every environment variable the recorded compile read still holds the value it saw.
+    ///
+    /// A registry unit's key does not carry them: they are compared here, against the values the
+    /// entry recorded from the `.d` of the compile that produced it. A variable that is set now and
+    /// was unset then, or the other way round, is a difference like any other.
+    fn env_deps_match(&self, deps: &[(String, Option<String>)]) -> bool {
+        deps.iter().all(|(name, recorded)| {
+            let current = std::env::var_os(name).map(|v| self.normalizer.normalize(&v.to_string_lossy()));
+            current.as_deref() == recorded.as_deref()
+        })
     }
 
     fn compile(&self, rustc: &OsStr, args: &[OsString], key: &Digest) -> Result<Outcome> {
@@ -402,12 +439,13 @@ impl Ctx<'_> {
         let stderr = err_thread.join().unwrap_or_default();
         let code = status.code().unwrap_or(1);
         if code != 0 {
-            log_decision("miss", self.krate, "compile-failed");
+            log_decision("miss", self.krate, &format!("compile-failed exit={code}"));
             return Ok(Outcome::Done(code));
         }
 
         let mut outputs = Vec::new();
         let mut skipped = false;
+        let mut env_deps = None;
         for (name, stamp) in scan_out_dir(self.out_dir, &prefixes) {
             // rustc rewrites every output it produces, so a candidate whose size and mtime are
             // untouched belongs to an earlier build of this unit and is not part of this entry.
@@ -420,6 +458,10 @@ impl Ctx<'_> {
             // on disk, or a later lookup reuses a digest for text that was never written.
             let (digest, on_disk) = if is_dep_info(&name) {
                 let bytes = fs::read(&path)?;
+                // The `# env-dep:` lines of the `.d` this compile wrote are the only record of what
+                // the unit read from the environment for a registry extraction, which never runs
+                // the pre-pass that reports them for the key.
+                env_deps = Some(env_deps_of(self.normalizer, &bytes));
                 let text = self.normalizer.normalize(&String::from_utf8_lossy(&bytes));
                 (self.store.put_bytes(text.as_bytes())?, Digest::of_bytes(&bytes))
             } else {
@@ -446,6 +488,19 @@ impl Ctx<'_> {
         }
         let entry = UnitEntry {
             outputs,
+            // A local or git unit keys its environment reads, so the entry has nothing to compare;
+            // a registry unit compares exactly these values on every lookup.
+            env_deps: if self.registry {
+                let Some(deps) = env_deps else {
+                    // No `.d`, so no record of what the unit read. A hit could then ignore a changed
+                    // variable, which is worse than not storing the entry.
+                    log_decision("miss", self.krate, "no-dep-info");
+                    return Ok(Outcome::Done(code));
+                };
+                deps
+            } else {
+                Vec::new()
+            },
             stdout: self.normalizer.normalize(&String::from_utf8_lossy(&stdout)),
             stderr: self.normalizer.normalize(&String::from_utf8_lossy(&stderr)),
         };
@@ -677,6 +732,17 @@ fn prepass_args(args: &[OsString], dir: &Path) -> Vec<OsString> {
     out
 }
 
+/// The environment variables a `.d` file records the compile reading, sorted by name and with each
+/// value normalized, so a value that spells a path the same way this checkout does compares equal.
+fn env_deps_of(normalizer: &Normalizer, dep_info: &[u8]) -> Vec<(String, Option<String>)> {
+    let mut deps: Vec<(String, Option<String>)> = depinfo::parse_env_deps(&String::from_utf8_lossy(dep_info))
+        .into_iter()
+        .map(|(name, value)| (name, value.map(|v| normalizer.normalize(&v))))
+        .collect();
+    deps.sort();
+    deps
+}
+
 /// The environment cargo set for this unit, plus the few variables that change compiler output.
 fn key_env(normalizer: &Normalizer) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
@@ -748,6 +814,10 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<bool>
 #[derive(Serialize, Deserialize)]
 struct UnitEntry {
     outputs: Vec<UnitOutput>,
+    /// The environment variables the compile read, with the values it saw, from its `.d` file. Only
+    /// a registry unit leaves them out of its key, and only that kind of entry fills this in.
+    #[serde(default)]
+    env_deps: Vec<(String, Option<String>)>,
     #[serde(default)]
     stdout: String,
     #[serde(default)]
