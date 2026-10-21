@@ -39,12 +39,16 @@ pub fn run(rustc: &OsStr, wrapper: Option<&OsStr>, args: &[OsString], inv: &Invo
         Ok(plan) => plan.seed(),
         Err(e) => wrapper::log_decision("noseed", krate, &format!("{e:#}")),
     }
+    // Which crate directory held which session before the compile. Afterwards, the one directory
+    // whose session changed is the one this invocation wrote; two changing at once cannot be told
+    // apart, and the snapshot is skipped rather than guessed.
+    let before = plan.as_ref().ok().map(|p| p.session_state());
     let started = SystemTime::now();
     let code = compile(rustc, wrapper, args);
     if code == 0
         && let Ok(plan) = plan
     {
-        plan.snapshot(started);
+        plan.snapshot(before, started);
     }
     code
 }
@@ -180,14 +184,23 @@ impl Plan {
     }
 
     /// Stores the newest finalized session this invocation wrote, plus its lock file.
-    fn snapshot(&self, started: SystemTime) {
+    fn snapshot(&self, before: Option<Result<Vec<SessionState>>>, started: SystemTime) {
         if disabled() || !self.snapshot_due() {
             return;
         }
+        let before = match before {
+            Some(Ok(state)) => state,
+            Some(Err(e)) => return wrapper::log_decision("nosnap", &self.krate, &format!("before: {e:#}")),
+            None => return wrapper::log_decision("nosnap", &self.krate, "no-plan"),
+        };
         let began = SystemTime::now();
-        if let Ok(Some((files, bytes))) = self.try_snapshot(started) {
-            let ms = began.elapsed().map(|d| d.as_millis()).unwrap_or(0);
-            wrapper::log_decision("snapshot", &self.krate, &format!("files={files} bytes={bytes} ms={ms}"));
+        match self.try_snapshot(&before, started) {
+            Ok(Some((files, bytes))) => {
+                let ms = began.elapsed().map(|d| d.as_millis()).unwrap_or(0);
+                wrapper::log_decision("snapshot", &self.krate, &format!("files={files} bytes={bytes} ms={ms}"));
+            }
+            Ok(None) => {}
+            Err(e) => wrapper::log_decision("nosnap", &self.krate, &format!("{e:#}")),
         }
     }
 
@@ -206,25 +219,50 @@ impl Plan {
         unix_secs().saturating_sub(entry.stored_at) >= SNAPSHOT_INTERVAL.as_secs()
     }
 
-    fn try_snapshot(&self, started: SystemTime) -> Result<Option<(usize, u64)>> {
-        let Some((crate_dir, session)) = self.session_for(started)? else {
+    fn try_snapshot(&self, before: &[SessionState], started: SystemTime) -> Result<Option<(usize, u64)>> {
+        let mut changed: Vec<SessionState> = self
+            .session_state()?
+            .into_iter()
+            .filter(|now| !before.contains(now))
+            .collect();
+        if changed.is_empty() {
+            wrapper::log_decision("nosnap", &self.krate, "no-session");
+            return Ok(None);
+        }
+        if changed.len() > 1 {
+            // Two crate directories changed during one compile. Neither can be attributed to this
+            // invocation, and picking one would overwrite another crate's lineage with wrong state.
+            wrapper::log_decision("nosnap", &self.krate, "ambiguous");
+            return Ok(None);
+        }
+        let state = changed.remove(0);
+        let Some((session, mtime)) = state.session else {
+            wrapper::log_decision("nosnap", &self.krate, "no-session");
             return Ok(None);
         };
+        if mtime < started {
+            wrapper::log_decision("nosnap", &self.krate, "session-not-from-this-compile");
+            return Ok(None);
+        }
+        let crate_dir = state.dir;
         let mut files = Vec::new();
         let mut bytes = 0u64;
         self.collect(&crate_dir, &crate_dir.join(&session), &mut files, &mut bytes)?;
         // A finalized session is named `s-<a>-<b>-<hash>`; its lock is `s-<a>-<b>.lock`. rustc does
         // not load a session without it, so an entry that cannot carry one is not worth storing.
         let Some(lock) = lock_file(&crate_dir, &session) else {
+            wrapper::log_decision("nosnap", &self.krate, "no-lock");
             return Ok(None);
         };
         if let Some((file, len)) = self.record_file(&crate_dir, &lock)? {
             bytes += len;
             files.push(file);
         } else {
+            wrapper::log_decision("nosnap", &self.krate, "lock-unreadable");
             return Ok(None);
         }
         if files.is_empty() {
+            wrapper::log_decision("nosnap", &self.krate, "no-files");
             return Ok(None);
         }
         let entry = IncrEntry {
@@ -239,31 +277,29 @@ impl Plan {
         Ok(Some((entry.files.len(), bytes)))
     }
 
-    /// The crate directory and its newest finalized `s-*` session, when that session was written at
-    /// or after `started`.
-    fn session_for(&self, started: SystemTime) -> Result<Option<(PathBuf, String)>> {
+    /// Every `<crate>-*` directory of the incremental directory, with the newest finalized session
+    /// in each. Taken before and after a compile, the difference names the directory this invocation
+    /// wrote.
+    fn session_state(&self) -> Result<Vec<SessionState>> {
         let prefix = format!("{}-", self.krate);
-        let mut best: Option<(PathBuf, String, SystemTime)> = None;
-        for entry in fs::read_dir(&self.dir)?.flatten() {
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            // A fresh target has no incremental directory until the first compile creates one.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.starts_with(&prefix) {
-                continue;
-            }
             let dir = entry.path();
-            if !dir.is_dir() {
+            if !name.starts_with(&prefix) || !dir.is_dir() {
                 continue;
             }
-            let Some((session, mtime)) = newest_session(&dir) else {
-                continue;
-            };
-            if mtime < started {
-                continue;
-            }
-            if best.as_ref().is_none_or(|(_, _, t)| mtime > *t) {
-                best = Some((dir, session, mtime));
-            }
+            let session = newest_session(&dir);
+            out.push(SessionState { dir, session });
         }
-        Ok(best.map(|(dir, session, _)| (dir, session)))
+        out.sort_by(|a, b| a.dir.cmp(&b.dir));
+        Ok(out)
     }
 
     fn collect(&self, crate_dir: &Path, dir: &Path, out: &mut Vec<IncrFile>, bytes: &mut u64) -> Result<()> {
@@ -314,6 +350,15 @@ impl Plan {
         let single = matches!(parts.next(), Some(Component::Normal(_))) && parts.next().is_none();
         single && subdir.starts_with(&format!("{}-", self.krate))
     }
+}
+
+/// One crate directory of the incremental directory and the newest finalized session inside it.
+/// Equality covers the session's name and mtime, so a directory a compile wrote into compares
+/// different before and after.
+#[derive(PartialEq, Eq)]
+struct SessionState {
+    dir: PathBuf,
+    session: Option<(String, SystemTime)>,
 }
 
 #[derive(Serialize, Deserialize)]
