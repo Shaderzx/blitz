@@ -423,7 +423,7 @@ impl Ctx<'_> {
                 // Every other output of a build-script unit is the real executable. The entry names it
                 // under the plain crate name, the name v0.2 used, but the bytes go next to the shim and
                 // the shim itself is written fresh because it names this blitz.
-                let exe = self.out_dir.join(&self.executable_name());
+                let exe = self.out_dir.join(self.executable_name());
                 let real = crate::buildscript::real_path(&exe);
                 self.store.materialize(&output.digest, &real, output.mode)?;
                 crate::buildscript::write_shim(&exe)?;

@@ -404,15 +404,15 @@ impl Ctx {
         let Ok(stderr_text) = std::str::from_utf8(stderr) else {
             bail!("stderr is not UTF-8");
         };
-        let (env_deps, paths) = self.watched(stdout_text)?;
+        let watched = self.watched(stdout_text)?;
         let mut files = Vec::new();
         let mut bytes = 0u64;
         self.collect(&self.out_dir, &mut files, &mut bytes)?;
         files.sort_by(|a, b| a.name.cmp(&b.name));
         let entry = BsEntry {
             files,
-            env_deps,
-            paths,
+            env_deps: watched.env,
+            paths: watched.paths,
             stdout: stdout_text.to_string(),
             stderr: stderr_text.to_string(),
             stored_at: unix_secs(),
@@ -484,7 +484,7 @@ impl Ctx {
 
     /// The `cargo:rerun-if-*` requests the script printed, with what they say today. A request the
     /// key already covers (anything inside the crate, anything in OUT_DIR) is left out.
-    fn watched(&self, stdout: &str) -> Result<(Vec<(String, Option<String>)>, Vec<BsPath>)> {
+    fn watched(&self, stdout: &str) -> Result<Watched> {
         let mut env_deps = Vec::new();
         let mut paths = Vec::new();
         for line in stdout.lines() {
@@ -520,7 +520,7 @@ impl Ctx {
         env_deps.dedup();
         paths.sort_by(|a, b| a.path.cmp(&b.path));
         paths.dedup_by(|a, b| a.path == b.path);
-        Ok((env_deps, paths))
+        Ok(Watched { env: env_deps, paths })
     }
 
     /// One line per decision, in the format of the other log lines.
@@ -531,6 +531,13 @@ impl Ctx {
     fn stats(&self, event: &str) {
         self.store.record(event, &self.label);
     }
+}
+
+/// What a stored run said it watches: the `cargo:rerun-if-env-changed` names with the value the run
+/// saw, and the `cargo:rerun-if-changed` paths outside the crate with the digest of what they held.
+struct Watched {
+    env: Vec<(String, Option<String>)>,
+    paths: Vec<BsPath>,
 }
 
 #[derive(Serialize, Deserialize)]

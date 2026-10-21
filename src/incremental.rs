@@ -270,7 +270,7 @@ impl Plan {
         // session whose command line differs, so it recompiles from scratch and never reuses foreign
         // state. Two sessions with the same timestamp cannot be told apart at all, and picking one
         // blind could hand this lineage the other's state, so that case stores nothing.
-        changed.sort_by(|a, b| session_time(b).cmp(&session_time(a)));
+        changed.sort_by_key(|a| std::cmp::Reverse(session_time(a)));
         if changed.len() > 1 && session_time(&changed[0]) == session_time(&changed[1]) {
             wrapper::log_decision("nosnap", &self.krate, "ambiguous");
             return Ok(None);
