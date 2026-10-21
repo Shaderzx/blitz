@@ -9,6 +9,7 @@
 mod cli;
 mod depinfo;
 mod hash;
+mod incremental;
 mod inputs;
 mod normalize;
 mod store;

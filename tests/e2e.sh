@@ -138,8 +138,10 @@ log=$work/unit.log
   >/dev/null 2>&1 || fail "the second per-unit build failed"
 grep -qE '^hit[[:space:]]+.*fixture[_-]lib' "$log" \
   || fail "no per-unit hit for fixture_lib in BLITZ_LOG: $(tr '\n' ' ' <"$log")"
+grep -qE '^hit[[:space:]]+build_script_build' "$log" \
+  || fail "no per-unit hit for build_script_build in BLITZ_LOG: $(tr '\n' ' ' <"$log")"
 expect_output "$unit" release fixture-value-one "the per-unit build"
-ok "the per-unit cache answers the library after cargo clean and the binary runs"
+ok "the per-unit cache answers the library and the build script after cargo clean and the binary runs"
 
 # 7. A broken build fails with cargo's exit code and stores nothing, so the same broken
 #    source fails again instead of being answered from the cache.
@@ -220,5 +222,33 @@ expect_output "$reader" debug fixture-value-one "the read-only restore"
 after=$( cd "$ro/prime" && find . -type f | sort | xargs shasum | shasum )
 [ "$before" = "$after" ] || fail "the read-only cache directory changed during the restore"
 ok "a read-only cache tier restores and stays unchanged"
+
+# 11. A fresh checkout has no incremental state of its own, so the first debug build of the library
+#     is seeded from the session an earlier compile stored; the edited library then compiles from
+#     that state and the binary prints the new value.
+seed_cache=$work/seed-cache
+seed_first=$work/seed-first
+copy_fixture "$seed_first"
+mkdir -p "$seed_first/watched"
+printf 'one\n' >"$seed_first/watched/first.txt"
+( cd "$seed_first" && BLITZ_CACHE_DIR=$seed_cache RUSTC_WRAPPER=$blitz cargo build --offline ) \
+  >/dev/null 2>&1 || fail "the debug build that fills the incremental cache failed"
+seed_second=$work/seed-second
+copy_fixture "$seed_second"
+mkdir -p "$seed_second/watched"
+printf 'one\n' >"$seed_second/watched/first.txt"
+cat >"$seed_second/lib/src/lib.rs" <<'EOF'
+pub fn value() -> &'static str {
+    "fixture-value-seeded"
+}
+EOF
+seed_log=$work/seed.log
+: >"$seed_log"
+( cd "$seed_second" && BLITZ_CACHE_DIR=$seed_cache BLITZ_LOG=$seed_log RUSTC_WRAPPER=$blitz cargo build --offline ) \
+  >/dev/null 2>&1 || fail "the seeded debug build failed"
+grep -qE '^seed[[:space:]]+fixture[_-]lib' "$seed_log" \
+  || fail "no seed line for fixture_lib in BLITZ_LOG: $(tr '\n' ' ' <"$seed_log")"
+expect_output "$seed_second" debug fixture-value-seeded "the seeded debug build"
+ok "a fresh checkout is seeded from the stored incremental session and prints the new value"
 
 echo "all e2e checks passed"

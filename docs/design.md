@@ -119,17 +119,22 @@ Cargo runs `blitz <rustc> <args>` for every compiler invocation. `wrapper::main`
 build because of the cache: any internal error runs the real compiler with the original arguments.
 
 1. Pass straight through (no caching) when: no `--crate-name`; any input is `-` (stdin); `-C
-   incremental=...` is present; the compiler is `clippy-driver` or anything other than a plain
-   rustc; crate types include `bin`, `dylib` or `cdylib` (linking pulls in system state); `--emit`
-   lacks both `link` and `metadata`; `BLITZ_DISABLE=1`.
-   Cacheable crate types: `lib`, `rlib`, `proc-macro`. A proc-macro is a linked artifact, so its key
-   also covers the linker binary and the SDK variables (decision 13 in `docs/decision-trail.md`).
+   incremental=...` is present (those invocations are seeded instead, see the next section); the
+   compiler is `clippy-driver` or anything other than a plain rustc; crate types include `bin`,
+   `dylib` or `cdylib` (linking pulls in system state); `--emit` lacks both `link` and `metadata`;
+   `BLITZ_DISABLE=1`.
+   Cacheable crate types: `lib`, `rlib`, `proc-macro`, and `bin` for a build script
+   (`build_script_*`). A proc-macro and a build script are linked artifacts, so their keys also
+   cover the linker binary and the SDK variables (decision 13 in `docs/decision-trail.md`, and
+   decision 26 for build scripts).
 2. Key (domain `blitz-unit-v2`):
    - `rustc_identity(<rustc>)` (argv[1] is the real toolchain binary; cache by its metadata).
    - The arguments in order, each normalized: replace the out-dir's target root (the directory two
-     levels above `--out-dir` when it ends in `<profile>/deps`; the build script dirs live under the
-     same root), the current directory, `CARGO_MANIFEST_DIR`, and `$CARGO_HOME` with placeholders
-     (`$TARGET`, `$CWD`, `$MANIFEST`, `$CARGO_HOME`). Longest prefix first.
+     levels above `--out-dir` when it ends in `<profile>/deps`, and three levels above a build
+     script's `<target>/<profile>/build/<pkg>-<hash>` so the `-L dependency=<target>/<profile>/deps`
+     path on its compile line normalizes too), the current directory, `CARGO_MANIFEST_DIR`, and
+     `$CARGO_HOME` with placeholders (`$TARGET`, `$CWD`, `$MANIFEST`, `$CARGO_HOME`). Longest prefix
+     first.
    - For every `--extern name=path`: the digest of the file's contents. Memoize digests in
      `<target root>/blitz/digests/<file name>` (size + mtime ns + digest) so each rlib is hashed once.
    - Environment: every `CARGO_*` variable cargo set for this invocation except `CARGO_MAKEFLAGS`
@@ -150,13 +155,13 @@ build because of the cache: any internal error runs the real compiler with the o
        changes the key before anything can be restored.
      - When `OUT_DIR` is set (the crate has a build script), hash every file under `OUT_DIR`
        (relative paths). Generated sources and bundled native libraries live there.
-3. Hit: entry `unit/<key>` lists output files (file name, digest), the normalized stdout and
+3. Hit: entry `unit/<key>` lists output files (file name, digest, mode), the normalized stdout and
    stderr, and the environment reads recorded for a registry unit. Materialize every output into
-   `--out-dir` (mode 0644), de-normalizing `.d` files on the way out (the stored `.d` has
-   placeholders), replay stdout and stderr de-normalized, update the digest memo for the restored
-   files (for a `.d`, the digest of the de-normalized bytes written), record `unit-hit` in stats,
-   exit 0. A recorded environment value that no longer matches the current environment makes the
-   entry a miss.
+   `--out-dir` with the recorded mode (0755 for a build script's executable, 0644 otherwise),
+   de-normalizing `.d` files on the way out (the stored `.d` has placeholders), replay stdout and
+   stderr de-normalized, update the digest memo for the restored files (for a `.d`, the digest of
+   the de-normalized bytes written), record `unit-hit` in stats, exit 0. A recorded environment
+   value that no longer matches the current environment makes the entry a miss.
 4. Miss: run the real compiler with stdout and stderr piped. Forward every stderr line to our stderr
    as it arrives (cargo reads the JSON artifact notifications on stderr for pipelining, so they must
    not be held back), and keep a copy. On exit 0, collect the outputs: files in `--out-dir` whose
@@ -166,7 +171,43 @@ build because of the cache: any internal error runs the real compiler with the o
    registry unit, read the `# env-dep:` lines out of that `.d` and store them in the entry; if the
    compile wrote no `.d`, do not store the entry, because a hit would then have nothing to compare
    the environment against.
-5. Log one line per decision to `$BLITZ_LOG` when set: `hit|miss|pass <crate> <reason>`.
+5. Log one line per decision to `$BLITZ_LOG` when set: `hit|miss|pass <crate> <reason>`; the
+   incremental path adds `seed <crate> <files>`, `noseed <crate> <reason>` and
+   `snapshot <crate> files=<n> bytes=<n> ms=<n>`.
+
+### Incremental seeding (`src/incremental.rs`, namespace `incr`)
+
+Cargo compiles workspace members in the dev profile with `-C incremental=<dir>`. v0.1 passed those
+invocations straight through, so on a fresh checkout the crate a user just edited had no state to
+resume from and compiled from scratch: `blitz warm + edit` on flowmaster/engine was 1.41x. rustc's
+incremental compilation is built to reuse its query cache and object files from an earlier compile
+of the same crate, and it checks every reused result itself (fingerprints; a session from another
+command line or compiler is discarded). blitz only has to put the state where rustc looks.
+
+Every compiler invocation that carries `-C incremental=<dir>` and `--crate-name <name>`, direct or
+behind a workspace wrapper such as `clippy-driver`, takes this path:
+
+1. **Lineage key** (domain `blitz-incr-v1`): the real compiler's `rustc -vV` text
+   (`toolchain::rustc_identity`), the chained driver's path, size and mtime when there is one, the
+   crate name, crate types, whether `--test` is present, `--target`, the profile directory name
+   (`debug`, `release`), and the normalized `CARGO_MANIFEST_DIR`. The sources, the `--extern`
+   digests and `-C metadata` are deliberately left out: they change between commits, and reusing
+   older state across them is the point.
+2. **Seed** before the compiler runs: look up `incr/<lineage>`. The entry records the crate's
+   incremental subdirectory (`<crate_name>-<id>`, one plain path component, rejected otherwise)
+   and its files (relative path with normal components only, digest, mode). If
+   `<dir>/<subdir>` does not exist, materialize the files into it through a staged directory and a
+   rename. If it exists, do nothing: local state is newer than any snapshot. The files include the
+   session's lock, whose name is the session name without its trailing hash component. rustc does
+   not load a session whose lock is missing, so an entry without one is not used. Log `seed` or
+   `noseed`; any error skips seeding and never fails the build.
+3. **Snapshot** after the compiler exits 0: find the `<crate_name>-*` directory whose newest
+   finalized `s-*` session (not `-working`) was modified at or after the invocation started, choose
+   that newest session, and store its files plus its lock. The blobs are written from the digest
+   memo, so unchanged object files are not re-hashed. A lineage snapshotted less than five minutes
+   ago is left alone unless `BLITZ_INCREMENTAL_SNAPSHOT=always`, which CI sets so every run leaves
+   the newest state for the next pull request. Log the file count, byte count and duration.
+4. `BLITZ_INCREMENTAL=off` disables seeding and snapshots.
 
 ## Correctness rules
 
