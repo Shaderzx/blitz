@@ -128,6 +128,11 @@ pub fn chained(args: &[OsString]) -> Option<i32> {
     // driver in front of the compiler, and the crate behind it is the same crate either way.
     let real = &args[1];
     let rest = &args[2..];
+    if std::env::var("BLITZ_DISABLE").is_ok_and(|v| v == "1") {
+        // Disabled means plain cargo, and cargo put this wrapper in the chain itself: run it and
+        // nothing of blitz, exactly as the unchained path does.
+        return Some(run_program(first, &args[1..]));
+    }
     let inv = parse(rest);
     if inv.incremental && inv.incremental_dir.is_some() {
         return Some(crate::incremental::run(real, Some(first), rest, &inv));
