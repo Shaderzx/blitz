@@ -242,7 +242,9 @@ crate that builds C in its build script that run dominates: on engine's CI build
    "absent". A lookup compares every one and misses on any difference, so a table-driven build script
    that switches on `AWS_LC_SYS_*` cannot answer with the wrong table. A `rerun-if-changed` path that
    resolves to a directory or a special file makes the run uncacheable rather than stale. Paths inside
-   the crate are left out: the script's own bytes already change when its sources do.
+   the crate are left out because the shim is only installed for an unpacked registry crate: its
+   extraction is immutable and checksum-verified, so nothing inside it can change while the key stays
+   the same.
 
 4. **Hit.** Only into an empty or missing `OUT_DIR`; anything already there belongs to this run, so the
    real script runs instead. Files are materialized with their recorded modes, directories are
