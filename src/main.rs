@@ -6,6 +6,7 @@
 //! - per-unit (`wrapper`): on a miss, cargo runs with blitz as `RUSTC_WRAPPER`, and every cacheable
 //!   rustc invocation is answered from the store when its inputs were compiled before.
 
+mod buildscript;
 mod cli;
 mod depinfo;
 mod hash;

@@ -93,7 +93,7 @@ without spawning rustup in the common case.
    with every build. `NotFound` is the only "absent"; any other read error
    means no entry is stored. Every `Cargo.toml` and `Cargo.lock` under the root is keyed even when
    git-ignored. File-valued `--config` falls back to plain
-   cargo (inline `key=value` is keyed as a string). Entries carry `ENTRY_VERSION` 3, so entries
+   cargo (inline `key=value` is keyed as a string). Entries carry `ENTRY_VERSION` 4, so entries
    from before these rules are never reused. A build that starts without a `Cargo.lock` stores no
    entry: cargo writes the lock during that build, so the recorded key could never be looked up.
    On a hit, every artifact path must be relative with only normal components; anything else is
@@ -120,7 +120,9 @@ build because of the cache: any internal error runs the real compiler with the o
 
 1. Pass straight through (no caching) when: no `--crate-name`; any input is `-` (stdin); `-C
    incremental=...` is present (those invocations are seeded instead, see the next section); the
-   compiler is `clippy-driver` or anything other than a plain rustc; crate types include `bin`,
+   real compiler is not a plain `rustc` (incremental units behind a chained wrapper such as
+   `clippy-driver` use incremental seeding; non-incremental chained units pass through uncached);
+   crate types include `bin`,
    `dylib` or `cdylib` (linking pulls in system state); `--emit` lacks both `link` and `metadata`;
    `BLITZ_DISABLE=1`.
    Cacheable crate types: `lib`, `rlib`, `proc-macro`, and `bin` for a build script
@@ -175,6 +177,134 @@ build because of the cache: any internal error runs the real compiler with the o
    incremental path adds `seed <crate> <files>`, `noseed <crate> <reason>` and
    `snapshot <crate> files=<n> bytes=<n> ms=<n>`.
 
+### Cached build-script runs (`src/buildscript.rs`, namespace `bsrun`)
+
+Cargo runs a build script itself: the compile goes through `RUSTC_WRAPPER`, the run does not. v0.2
+cached the compile, so a fresh target restored the executable and still paid for every run, and for a
+crate that builds C in its build script that run dominates: on engine's CI build `aws-lc-sys` took
+11.9 s of a 24.5 s edit build and nothing of engine started before 13.1 s. v0.3 caches the run too.
+
+1. **Shim.** When the wrapper compiles the build script of an unpacked registry crate
+   (`build_script_*`, crate type `bin`, manifest under `$CARGO_HOME/registry/src` with `.cargo-ok`), it
+   renames the executable to `<file>.blitz-real` and writes a `/bin/sh` shim in its place:
+
+   ```sh
+   #!/bin/sh
+   if [ -x '<blitz>' ] && [ "${BLITZ_BUILD_SCRIPT_RUN:-on}" != off ]; then
+       BLITZ_BSRUN_MARK='<file>.blitz-real'.blitz-mark.$$
+       export BLITZ_BSRUN_MARK
+       rm -f "$BLITZ_BSRUN_MARK"
+       '<blitz>' build-script-run '<file>.blitz-real' "$@"
+       code=$?
+       if [ -e "$BLITZ_BSRUN_MARK" ]; then rm -f "$BLITZ_BSRUN_MARK"; exit "$code"; fi
+       if [ "$code" -ne 0 ]; then exec '<file>.blitz-real' "$@"; fi
+       exit 0
+   fi
+   exec '<file>.blitz-real' "$@"
+   ```
+
+   The paths are absolute and single-quoted. Cargo hard-links the executable to `build-script-build`
+   after the compile returns, so whichever name it runs is the shim. The shim still works when blitz
+   is gone (a CI run whose blitz download failed reuses the same target volume), and it falls back to
+   the real script when blitz exits non-zero without a marker. A non-zero exit alone also describes
+   a script that failed, or blitz killed by the kernel. Running a script that already ran a
+   second time repeats its side effects and its output. blitz therefore touches
+   `$BLITZ_BSRUN_MARK`, `<real>.blitz-mark.$$` beside the real binary, after successfully spawning
+   the real script, and never removes it: the shim does. The marker
+   lives in cargo's own writable build directory, so a `$TMPDIR` that cannot be written cannot cost
+   the fallback its precision. A marker means the script is what produced the code, or is producing
+   it. Without a marker after a non-zero exit, the shim assumes nothing ran and execs the script.
+   An exit of zero removes the marker and exits 0. If the shim itself is killed, its marker can remain under
+   target until cargo cleans it.
+   The marker prevents duplicate runs after spawn; it cannot make marking and spawning atomic. If
+   writing the marker fails, a non-zero exit can still cause a duplicate run. Path and workspace crates
+   keep the plain executable, because cargo recompiles their build script whenever their sources change
+   and their runs are not the expensive ones. The per-unit entry stores the real binary (mode 0755)
+   under the hashed
+   executable name cargo gave the script (`build_script_build-<meta>`), the name it had before the
+   shim replaced it and the name v0.2 stored, and never the shim; a restore writes the shim fresh, so
+   it names the blitz doing the restoring, and a v0.2 binary can still read a v0.3 entry. Only that
+   executable uses the real path and mode 0755. Extra outputs, including split-debuginfo object files,
+   keep their own names and mode 0644.
+
+2. **Key** (domain `blitz-bsrun-v3`, so entries from before tool, environment and replay fixes are not reused):
+   - the BLAKE3 digest of the real executable (a recompile, a new compiler or a new linker changes it);
+   - `OUT_DIR` as a literal path (CI spells it identically on every run; another path is another key);
+   - every environment variable cargo sets for a build script (`CARGO_*`, plus `TARGET`, `HOST`,
+     `PROFILE`, `OPT_LEVEL`, `DEBUG`, `RUSTC`, `RUSTC_LINKER`), except `CARGO_MAKEFLAGS` (a jobserver
+     token that changes on every build) and `NUM_JOBS` (parallelism, not output);
+   - every `DEP_*` name and value Cargo supplies from dependencies with `links`, even without an
+     explicit `rerun-if-env-changed` directive;
+   - the C tooling variables a build script reads: `CC`, `CXX`, `AR`, `CFLAGS`, `CXXFLAGS`,
+     `LDFLAGS`, `CPPFLAGS` in their plain, `<name>_<target>`, `TARGET_<name>` and `HOST_<name>`
+     forms, plus anything starting with `PKG_CONFIG` or `CMAKE`;
+   - every variable named after the crate (`AWS_LC_SYS_*`, `RING_*`): `CARGO_PKG_NAME` upper-cased
+     with `-` as `_`, followed by `_`;
+   - the identity (real path, size, mtime) of `cc`, `c++`, `cmake`, `ar`, `ld`, `perl`, `pkg-config`,
+     `make`, `python3`, `protoc`, `nasm`, `clang` and `git` on `PATH`, plus the effective
+     target-prefixed and host-prefixed names selected from `TARGET` and `HOST`, or the fact that one
+     is absent. The raw `PATH` also enters the key. Each path is canonicalised before it is recorded,
+     and the resolver requires execute permission, so a symlink or replacement tool changes the key.
+     Explicit executable overrides, including `CC`, `CXX`, `AR`, `PKG_CONFIG`, `RUSTC` and
+     `RUSTC_LINKER` forms, contribute their resolved path and content digest. An unresolved selection,
+     command string, or non-UTF-8 selection bypasses the run cache.
+
+3. **Direct mode.** The stdout of a stored run is parsed for `cargo:rerun-if-env-changed=NAME` and
+   `cargo:rerun-if-changed=PATH`. Each name is stored with the value the run saw, and each path
+   outside `CARGO_MANIFEST_DIR` and outside `OUT_DIR` with the digest of the file it held, or with
+   "absent". A lookup compares every one and misses on any difference, so a table-driven build script
+   that switches on `AWS_LC_SYS_*` cannot answer with the wrong table. A `rerun-if-changed` path that
+   resolves to a directory or a special file makes the run uncacheable rather than stale. Paths inside
+   the crate are left out because the shim is only installed for an unpacked registry crate: its
+   extraction is immutable and checksum-verified, so nothing inside it can change while the key stays
+   the same. A watch is omitted only when both its original spelling and resolved target are inside
+   the crate or `OUT_DIR`, with no `..` in its spelling. External watches retain their original path
+   even when their current target is internal. Retargeting an external link therefore rechecks its
+   current bytes. An unresolved path is watched, not ignored. Only `NotFound` records or matches
+   absence. Directories, special files and other metadata or read errors reject caching. Instruction
+   parsing trims the complete line and its value, matching Cargo's whitespace handling.
+
+4. **Hit.** Only into an empty or missing `OUT_DIR`; anything already there belongs to this run, so the
+   real script runs instead. Cargo directives replay before output restoration. If directive replay
+   fails after stdout starts, blitz returns an error and never runs the real script a second time.
+   Files are materialized with their recorded modes, directories are recreated from entries of their
+   own (an empty one has no file to carry it), and symlinks are recreated with their targets: a link
+   that resolves to a file is stored with the digest of that target and verified on every lookup, and
+   a link to a directory or a special file makes the run uncacheable. Regular files and directories
+   are restored before links. All links are created before their target digests are checked, so forward
+   references and link chains work. An explicitly recorded dangling link must still return `NotFound`;
+   a target appearing later rejects the hit. Before any writes, validation rejects non-normal names,
+   normalized duplicate names, conflicting types and any non-directory ancestor of another entry.
+   Leaf symlinks may target external files, but restoration never writes through them. Directory modes
+   are applied deepest-first after the tree is populated and links are checked. A restore that fails
+   removes and recreates `OUT_DIR` before the caller can run the real script.
+
+5. **Miss.** The real binary runs with the same arguments, environment, working directory and stdin;
+   its stdout and stderr are forwarded as they arrive and recorded; its exit code is returned
+   unchanged. The run is stored only when it exited 0, `OUT_DIR` was empty or missing before it
+   started, both streams were read and forwarded completely, and all output names are UTF-8.
+   Interrupted reads retry; other read or forwarding errors prevent storing the run. A forwarding
+   error does not stop draining the other output or change the script's exit code.
+   Every internal error (no key, unreadable entry,
+   missing blob, disk full, a name that cannot go into the shim) falls back to running the real
+   binary, so a broken cache can cost a run and never a build.
+
+6. Log `bsrun-hit`, `bsrun-miss` and `bsrun-store` to `$BLITZ_LOG` in the usual format and count them
+   in `blitz stats`. Each real script run counts one `bsrun-miss`, even when storing fails.
+   `BLITZ_BUILD_SCRIPT_RUN=off` and `BLITZ_DISABLE=1` take the real binary even when blitz is there.
+   Runs live in `ac/bsrun/` with their blobs in `cas/`, so `blitz gc` trims them with everything else.
+
+What still misses: a registry crate whose build script reads something outside the key (the machine's
+`/usr/include`, the time of day, a network response) produces the same key with different bytes;
+`rerun-if-changed` is the only way such a script can tell blitz, and cargo has the same blindness. A run
+that writes outside `OUT_DIR`, into its own registry extraction or into `/tmp`, is not restored. Git
+checkouts and path crates are not shimmed at all.
+
+What the tool identities do not cover: system libraries and headers a script probes, through
+`pkg-config` or by scanning `/usr/include`, are not in the key. A changed system library under an
+unchanged toolchain can therefore hit. The CI images pin their toolchain, so this is a limit of a
+hand-managed machine, not of CI; `BLITZ_BUILD_SCRIPT_RUN=off` disables the run cache entirely.
+
 ### Incremental seeding (`src/incremental.rs`, namespace `incr`)
 
 Cargo compiles workspace members in the dev profile with `-C incremental=<dir>`. v0.1 passed those
@@ -190,8 +320,10 @@ behind a workspace wrapper such as `clippy-driver`, takes this path:
 1. **Lineage key** (domain `blitz-incr-v1`): the real compiler's `rustc -vV` text
    (`toolchain::rustc_identity`), the chained driver's path, size and mtime when there is one, the
    crate name, crate types, whether `--test` is present, `--target`, the profile directory name
-   (`debug`, `release`), and the normalized `CARGO_MANIFEST_DIR`. The sources, the `--extern`
-   digests and `-C metadata` are deliberately left out: they change between commits, and reusing
+   (`debug`, `release`), and the normalized `CARGO_MANIFEST_DIR`, the package name and version, and
+   the manifest's path relative to the workspace root, so two packages with one crate name (or one
+   package's library and its bench) never share a lineage. The sources, the `--extern` digests and
+   `-C metadata` are deliberately left out: they change between commits, and reusing
    older state across them is the point.
 2. **Seed** before the compiler runs: look up `incr/<lineage>`. The entry records the crate's
    incremental subdirectory (`<crate_name>-<id>`, one plain path component, rejected otherwise)
@@ -201,12 +333,19 @@ behind a workspace wrapper such as `clippy-driver`, takes this path:
    session's lock, whose name is the session name without its trailing hash component. rustc does
    not load a session whose lock is missing, so an entry without one is not used. Log `seed` or
    `noseed`; any error skips seeding and never fails the build.
-3. **Snapshot** after the compiler exits 0: find the `<crate_name>-*` directory whose newest
-   finalized `s-*` session (not `-working`) was modified at or after the invocation started, choose
-   that newest session, and store its files plus its lock. The blobs are written from the digest
-   memo, so unchanged object files are not re-hashed. A lineage snapshotted less than five minutes
-   ago is left alone unless `BLITZ_INCREMENTAL_SNAPSHOT=always`, which CI sets so every run leaves
-   the newest state for the next pull request. Log the file count, byte count and duration.
+3. **Snapshot** after the compiler exits 0: every `<crate_name>-*` directory and its newest finalized
+   `s-*` session (not `-working`) were recorded before the compile, so the one directory whose
+   session changed during it is the crate directory this invocation wrote; that newest session's
+   files plus its lock are stored. Under concurrent lib and test compiles the newest changed session
+   can belong to the sibling instead: that only costs a seed, because rustc discards a session whose
+   command line differs, and it never produces wrong output. Two sessions with one timestamp cannot
+   be attributed at all, so the snapshot is skipped (`nosnap ambiguous`). The blobs are written
+   from the digest memo, so unchanged object files are not re-hashed. A lineage snapshotted less
+   than five minutes ago is left alone unless `BLITZ_INCREMENTAL_SNAPSHOT=always`, which adopting CI
+   sets (the FlowMaster repos do), so every run leaves the newest state for the next pull request.
+   Log the file count, byte count and duration, and log `nosnap <reason>` when a snapshot is
+   skipped. Staging directories a killed build left behind (`.blitz-seed-*` older than an hour) are
+   deleted when the next seed runs.
 4. `BLITZ_INCREMENTAL=off` disables seeding and snapshots.
 
 ## Correctness rules
@@ -214,13 +353,16 @@ behind a workspace wrapper such as `clippy-driver`, takes this path:
 - A stale hit is the worst possible bug. When in doubt, miss.
 - Keys never include absolute paths that differ between checkouts, and always include everything
   that changes output bytes.
-- Failed compiles are never cached.
+- Failed compiles and failed build-script runs are never cached.
+- A cached build-script run is restored only into an empty `OUT_DIR`, and every `rerun-if-*` request
+  the script printed is compared on the way in.
 - Read-only tiers are never written (enforced in `Store`).
 
 ## Proof
 
 - `tests/e2e.sh`: drives the real `blitz` binary on a small real workspace (a binary crate plus a
   path-dependency library) in a temp dir: miss, clean, hit, edit invalidates, env change
-  invalidates, per-unit hits on a release build after `cargo clean`. One script, no unit tests.
+  invalidates, per-unit hits on a release build after `cargo clean`, a registry crate's build script
+  shimmed and its run restored into a fresh target. One script, no unit tests.
 - `bench/bench.py <repo path>`: fresh clones, measured scenarios, a markdown table. See
   `docs/benchmarks.md` for the recorded numbers.

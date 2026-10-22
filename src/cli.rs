@@ -16,6 +16,7 @@ USAGE:
     blitz stats                      show cache hits and misses
     blitz gc --max-size <SIZE>       trim the cache to SIZE (e.g. 20G), oldest first
     blitz cache-dir                  print the cache directories
+    blitz build-script-run <real>    run a build script through the cache (used by the shim cargo runs)
 
 ENVIRONMENT:
     BLITZ_CACHE_DIR   writable cache directory (default ~/.cache/blitz)
@@ -23,6 +24,7 @@ ENVIRONMENT:
     BLITZ_READONLY=1  never write to the cache
     BLITZ_VERIFY=1    re-hash every restored blob and drop the ones that do not match
     BLITZ_DISABLE=1   run plain cargo, no caching
+    BLITZ_BUILD_SCRIPT_RUN=off         do not route build-script runs through the cache
     BLITZ_LOG=<file>  append a line per cache decision to <file>
     BLITZ_INCREMENTAL=off             do not seed or snapshot incremental state
     BLITZ_INCREMENTAL_SNAPSHOT=always snapshot on every compile instead of every five minutes
@@ -67,6 +69,7 @@ fn dispatch(args: &[OsString]) -> Result<i32> {
             Ok(0)
         }
         "gc" => gc(rest),
+        "build-script-run" => Ok(crate::buildscript::main(rest)),
         other => {
             let wrap = !std::env::var("BLITZ_DISABLE").is_ok_and(|v| v == "1");
             run_cargo(other, rest, wrap)

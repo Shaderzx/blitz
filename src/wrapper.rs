@@ -99,6 +99,7 @@ const SUBCOMMANDS: &[&str] = &[
     "stats",
     "gc",
     "cache-dir",
+    "build-script-run",
     "help",
     "-h",
     "--help",
@@ -128,6 +129,11 @@ pub fn chained(args: &[OsString]) -> Option<i32> {
     // driver in front of the compiler, and the crate behind it is the same crate either way.
     let real = &args[1];
     let rest = &args[2..];
+    if std::env::var("BLITZ_DISABLE").is_ok_and(|v| v == "1") {
+        // Disabled means plain cargo, and cargo put this wrapper in the chain itself: run it and
+        // nothing of blitz, exactly as the unchained path does.
+        return Some(run_program(first, &args[1..]));
+    }
     let inv = parse(rest);
     if inv.incremental && inv.incremental_dir.is_some() {
         return Some(crate::incremental::run(real, Some(first), rest, &inv));
@@ -413,6 +419,16 @@ impl Ctx<'_> {
                 write_atomic(&dest, &bytes, output.mode)?;
                 // The memo has to describe the bytes on disk, which are not the stored text.
                 Digest::of_bytes(&bytes)
+            } else if self.build_script && self.registry && output.name == self.executable_name() {
+                // Only the executable belongs next to the shim. The entry names it
+                // under the plain crate name, the name v0.2 used, but the bytes go next to the shim and
+                // the shim itself is written fresh because it names this blitz.
+                let exe = self.out_dir.join(self.executable_name());
+                let real = crate::buildscript::real_path(&exe);
+                self.store.materialize(&output.digest, &real, output.mode)?;
+                crate::buildscript::write_shim(&exe)?;
+                remember_digest(self.target_root, &real, &output.digest);
+                continue;
             } else {
                 self.store.materialize(&output.digest, &dest, output.mode)?;
                 output.digest
@@ -466,7 +482,31 @@ impl Ctx<'_> {
         let mut outputs = Vec::new();
         let mut skipped = false;
         let mut env_deps = None;
+        // Cargo runs a build script itself, after this wrapper returns, so the compile cache cannot
+        // answer the run. Renaming the executable and leaving a shim in its place turns that run into
+        // `blitz build-script-run`, which caches OUT_DIR and stdout. Only an unpacked registry crate:
+        // its sources cannot change under the key, so the script's own bytes and the environment
+        // describe the run. A failure leaves the compile's output untouched and logs why.
+        let exe_name = self.executable_name();
+        let shimmed = self.build_script && self.registry && {
+            match crate::buildscript::install_shim(&self.out_dir.join(&exe_name)) {
+                Ok(()) => true,
+                Err(e) => {
+                    log_decision("bsrun-shim", self.krate, &format!("error: {e:#}"));
+                    false
+                }
+            }
+        };
         for (name, stamp) in scan_out_dir(self.out_dir, &prefixes) {
+            // The shim carries this blitz's path and is written fresh on every restore, so it is not
+            // part of the entry. The real executable next to it is stored under the hashed name cargo
+            // gave the script (`build_script_build-<meta>`), the name it had before the shim replaced
+            // it and the name v0.2 stored: a v0.2 entry restores here, and this entry restores there.
+            let stored_name = match (shimmed, name.strip_suffix(".blitz-real")) {
+                (true, Some(stem)) => stem.to_string(),
+                (true, None) if name == exe_name => continue,
+                _ => name.clone(),
+            };
             // rustc rewrites every output it produces, so a candidate whose size and mtime are
             // untouched belongs to an earlier build of this unit and is not part of this entry.
             if before.get(&name) == Some(&stamp) {
@@ -476,7 +516,7 @@ impl Ctx<'_> {
             let path = self.out_dir.join(&name);
             // A build script's executable is linked, so it is stored and restored executable; every
             // other output is a plain file.
-            let mode = if self.build_script && !is_dep_info(&name) {
+            let mode = if self.build_script && stored_name == exe_name {
                 0o755
             } else {
                 0o644
@@ -496,7 +536,11 @@ impl Ctx<'_> {
                 (stored, stored)
             };
             remember_digest(self.target_root, &path, &on_disk);
-            outputs.push(UnitOutput { name, digest, mode });
+            outputs.push(UnitOutput {
+                name: stored_name,
+                digest,
+                mode,
+            });
         }
         if skipped {
             // This unit normally writes a file that this compile left untouched: storing the rest
@@ -531,6 +575,11 @@ impl Ctx<'_> {
         self.store.record("unit-miss", self.krate);
         log_decision("miss", self.krate, "compiled");
         Ok(Outcome::Done(code))
+    }
+
+    /// The build script's executable name as rustc writes it: the crate name plus `extra-filename`.
+    fn executable_name(&self) -> String {
+        format!("{}{}", self.krate.replace('-', "_"), self.extra_filename)
     }
 
     fn output_prefixes(&self) -> Vec<String> {
@@ -727,10 +776,30 @@ fn linker_identity(linker: Option<&str>) -> Option<Digest> {
 
 pub(crate) fn find_program(name: &Path) -> Option<PathBuf> {
     if name.components().count() > 1 {
-        return name.is_file().then(|| name.to_path_buf());
+        return executable(name).then(|| name.to_path_buf());
     }
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|d| d.join(name)).find(|p| p.is_file())
+    std::env::split_paths(&path)
+        .map(|d| d.join(name))
+        .find(|p| executable(p))
+}
+
+fn executable(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 struct DepInfo {

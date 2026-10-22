@@ -1,6 +1,6 @@
 [package]
 name = "blitz"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A cargo front-end with a whole-build cache and a per-crate content-addressed cache"

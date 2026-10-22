@@ -17,6 +17,9 @@ blitz stats            # cache hits and misses
   earlier compile stored, instead of compiling it from scratch.
 - **Cached build scripts.** Build-script binaries are restored like proc-macros, so a clean build
   does not recompile them on every run.
+- **Cached build-script runs.** A registry crate's build script is restored as well: blitz runs it
+  through a small shim in front of the compiled executable, and a fresh target gets the script's
+  `OUT_DIR` and stdout from the cache instead of spending seconds building C or generating tables.
 
 How it works and what it does not do: [docs/design.md](docs/design.md). Measured numbers:
 [docs/benchmarks.md](docs/benchmarks.md).

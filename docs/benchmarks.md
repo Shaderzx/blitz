@@ -123,21 +123,89 @@ compare each row with `cargo cold` from its own table as well as the absolute se
 | cargo no-op | 0.114 | | 1.00x |
 | blitz no-op | 0.011 | | 9.92x |
 
-`blitz warm + edit` fell from 28.523 s to 24.604 s, and from 86% of that run's cold build to
-70%. The gain is bounded by rustc: it discards an incremental session whose command line
-differs, and a fresh checkout spells `--out-dir`, `-L` and the source paths differently, so
-little of another checkout's session is reused. Seeding the same tree is where the feature
-pays: on a checkout that had built once, deleting the incremental state and editing one
-library line rebuilt in 17.0 s without seeding and 2.3 s with a snapshot taken from that
-same compiled state.
+`blitz warm + edit` fell from 28.523 s to 24.604 s across checkouts, but those medians overlap:
+before [33.818, 24.787, 28.523] s, after [25.244, 24.604, 24.364] s, on a shared machine under
+load. That row cannot separate seeding from noise, and it is not the evidence for the feature.
 
-Build scripts: on a fresh checkout of the same revision, 313 of 318 units came from the cache
-(35 build-script units used to miss every time). The snapshot cost measured during that
-debug build was 261 files / 314.2 MB in 249 ms for the library lineage and 218 files / 54.1 MB
-in 100 ms for the binary lineage, about 0.8% of a 44 s cold build.
+The evidence is the same path, measured on the CI host (fm-hel-03-ai, 64 cores, Docker, CI paths
+`/src` and `/target`, `CARGO_BUILD_JOBS=4`, engine `cargo test --no-run`, empty target after a
+one-line edit): seeding off 79.4 s, seeding on 27.3 s, and 24.5 s with line-tables-only debug
+info. On that host plain cargo cold is 136.8 s, blitz cold 139.6 s and line-tables-only cold
+120.6 s. A fresh checkout reuses little, because rustc discards a session whose command line
+differs and another checkout spells `--out-dir`, `-L` and the source paths differently; the same
+tree does, which is the case CI has after its first build and on every branch switch in one
+working copy. On a local checkout that had built once, deleting the incremental state and editing
+one library line rebuilt in 17.0 s without seeding and 2.3 s with a snapshot from that same state.
+
+The snapshot cost measured during that debug build was 261 files / 314.2 MB in 249 ms for the
+library lineage and 218 files / 54.1 MB in 100 ms for the binary lineage, about 0.8% of a 44 s cold
+build.
 
 Raw runs: [`bench/results-engine-2026-10-21-v0.2-before.json`](../bench/results-engine-2026-10-21-v0.2-before.json)
 and [`bench/results-engine-2026-10-21-v0.2-after.json`](../bench/results-engine-2026-10-21-v0.2-after.json).
+
+## v0.3: cached build-script runs (2026-10-21)
+
+Measured on the CI host, fm-hel-03-ai (x86_64, 64 cores, Docker `rust:1-bookworm`, rustc 1.99.1),
+with the same paths CI uses (`/src`, `/target`, `/blitz-cache`), `CARGO_BUILD_JOBS=4`, engine
+`cargo test --no-run --locked --timings` in the dev profile with `CARGO_PROFILE_DEV_DEBUG` and
+`CARGO_PROFILE_TEST_DEBUG` set to `line-tables-only`. Each run starts with
+`find /target -mindepth 1 -delete` after one probe function is appended to `src/lib.rs`.
+
+Both binaries ran the same recipe minutes apart on the same host. v0.2.0 (`d178be2`) used its own
+empty cache (`/blitz-cache-v02`), warmed first; v0.3.0 used the warm v0.2 cache with its new entries
+added.
+
+| run | seconds |
+| --- | --- |
+| v0.2, warm-up (empty cache) | 120.1 |
+| v0.2, edit run | 23.8 |
+| v0.3, warm-up (v0.2 entries reused) | 48.8 |
+| v0.3, edit run | **14.0** |
+| v0.3, edit run minutes later, same recipe | 12.4 |
+| v0.3, the same edit run again, identical inputs | 8.9 |
+| v0.3, edit run with `CARGO_BUILD_JOBS=16` | 14.2 |
+| v0.3, edit run on the same tree with the run cache off (`BLITZ_BUILD_SCRIPT_RUN=off`) | 29.3 |
+| v0.3, edit run with the final binary, after `blitz gc` had trimmed the cache | 17.9 |
+
+On the 14.0 s run, 309 of the 311 units came from the per-unit cache and 2 passed through; the 35
+build-script units that used to miss on every build are the 35 run hits.
+
+Five v0.3 edit runs on this recipe measured 12.4, 13.7, 14.0, 14.2 and 17.9 s. The unit work was the
+same in all of them (309 unit hits, 35 run hits, 2 pass-throughs, 25 seeds); what moved was how long
+the restores take, and the 17.9 s run paid for a cache whose blobs had just been trimmed out of the
+page cache by `blitz gc`.
+
+The same scenario measured 24.5 s for v0.2 before this work, and 23.8 s for the v0.2 control above,
+so the edit run fell by 1.7x against the control and 1.75x against the earlier figure, and reaches the
+12 s this change was aimed at. Decision counts for the 14.0 s run: 35 `bsrun-hit`, 309 unit hits, 2
+pass-throughs and 25 seeds. The run-cache-off run had different decisions: 311 unit hits, 3 misses,
+8 pass-throughs, 25 seeds and 25 snapshots. Its unit counts match the v0.2 control, not the cached
+v0.3 run. The snapshots ran because more than five minutes had passed since the last snapshot.
+
+Where the time went, from `cargo --timings` (unit durations, not wall time):
+
+| unit | v0.2 seconds | v0.3 seconds | v0.3 start |
+| --- | --- | --- | --- |
+| `aws-lc-sys` build-script run | 11.45 | 0.12 | 0.79 |
+| `ring` build-script run | 2.07 | 0.03 | 0.83 |
+| `engine` lib, test build | 6.46 | 6.38 | 2.40 |
+| `engine` lib | 3.82 | 3.96 | 2.39 |
+
+Nothing of engine started before 12.57 s in the v0.2 run, and 2.39 s in the v0.3 run: the
+build-script runs were the head of the critical path and now restore in about a tenth of a second
+each. Total unit seconds fell from 56.0 to 43.9.
+
+The cleanest single measure of the feature is the pair on the same tree: 29.3 s with
+`BLITZ_BUILD_SCRIPT_RUN=off` and 12.4 s with it on, 2.4x. The two C build scripts account for
+13.52 s of combined unit work in v0.2, not elapsed critical-path time: they start at 0.71 s and
+0.75 s and overlap. Engine's first start moves from 12.57 s to 2.39 s, a 10.18 s shift in the
+dependency timeline. The wall gain against the v0.2 control is 9.8 s.
+
+The cache grew from 5.7 GB to 7.1 GB over the warm-up and five edit runs; `blitz gc --max-size 6G`
+then removed 1,126 files and left 6,119 MiB, so the run entries are trimmed like everything else.
+
+Raw numbers: [`bench/results-engine-2026-10-21-v0.3-ci.json`](../bench/results-engine-2026-10-21-v0.3-ci.json).
 
 ## Reading the numbers
 

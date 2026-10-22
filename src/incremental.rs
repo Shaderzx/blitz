@@ -28,6 +28,10 @@ use crate::wrapper::{self, Invocation};
 /// newest state for the next pull request.
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(300);
 
+/// How long a seed staging directory may sit in the incremental directory before a later seed treats
+/// it as the remains of a killed build and deletes it.
+const STALE_SEED_AGE: Duration = Duration::from_secs(3600);
+
 /// Runs an incremental compiler invocation with seeding before it and a snapshot after it.
 ///
 /// `wrapper` is the workspace wrapper cargo put in front of the compiler (`clippy-driver`), or
@@ -39,12 +43,16 @@ pub fn run(rustc: &OsStr, wrapper: Option<&OsStr>, args: &[OsString], inv: &Invo
         Ok(plan) => plan.seed(),
         Err(e) => wrapper::log_decision("noseed", krate, &format!("{e:#}")),
     }
+    // Which crate directory held which session before the compile. Afterwards, the one directory
+    // whose session changed is the one this invocation wrote; two changing at once cannot be told
+    // apart, and the snapshot is skipped rather than guessed.
+    let before = plan.as_ref().ok().map(|p| p.session_state());
     let started = SystemTime::now();
     let code = compile(rustc, wrapper, args);
     if code == 0
         && let Ok(plan) = plan
     {
-        plan.snapshot(started);
+        plan.snapshot(before, started);
     }
     code
 }
@@ -90,6 +98,26 @@ impl Plan {
         let manifest = std::env::var_os("CARGO_MANIFEST_DIR").context("no CARGO_MANIFEST_DIR")?;
         let manifest = Path::new(&manifest);
         k.part("manifest", normalizer.normalize(&manifest.to_string_lossy()).as_bytes());
+        // The normalizer maps every package's manifest directory to the same `$MANIFEST` token, so on
+        // its own it cannot tell two packages with the same crate name apart, and a bench or example
+        // target of one package would share a lineage with the library. Package name, version and the
+        // manifest's path inside the workspace keep them distinct without putting the checkout into
+        // the key.
+        k.part(
+            "pkg-name",
+            std::env::var("CARGO_PKG_NAME").unwrap_or_default().as_bytes(),
+        );
+        k.part(
+            "pkg-version",
+            std::env::var("CARGO_PKG_VERSION").unwrap_or_default().as_bytes(),
+        );
+        k.part(
+            "manifest-rel",
+            workspace_relative(manifest)
+                .as_deref()
+                .unwrap_or("<outside>")
+                .as_bytes(),
+        );
 
         Ok(Plan {
             store,
@@ -130,6 +158,7 @@ impl Plan {
             return Ok(None);
         }
         fs::create_dir_all(&self.dir)?;
+        self.remove_stale_seeds();
         let tmp = self
             .dir
             .join(format!(".blitz-seed-{}-{}", std::process::id(), unique()));
@@ -147,6 +176,30 @@ impl Plan {
         }
     }
 
+    /// Removes seed staging directories a killed build left behind, so they do not accumulate in the
+    /// shared incremental directory. Only ones older than an hour: a concurrent build may be filling
+    /// its own right now.
+    fn remove_stale_seeds(&self) {
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(".blitz-seed-") {
+                continue;
+            }
+            let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+                continue;
+            };
+            let stale = SystemTime::now()
+                .duration_since(modified)
+                .is_ok_and(|age| age > STALE_SEED_AGE);
+            if stale {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+
     fn materialize(&self, entry: &IncrEntry, root: &Path) -> Result<()> {
         for file in &entry.files {
             let rel = safe_rel(&file.path)?;
@@ -160,14 +213,27 @@ impl Plan {
     }
 
     /// Stores the newest finalized session this invocation wrote, plus its lock file.
-    fn snapshot(&self, started: SystemTime) {
+    fn snapshot(&self, before: Option<Result<Vec<SessionState>>>, started: SystemTime) {
         if disabled() || !self.snapshot_due() {
             return;
         }
+        if self.store.writable_root().is_none() {
+            // Nothing can be stored, so a snapshot line would only report state that does not exist.
+            return;
+        }
+        let before = match before {
+            Some(Ok(state)) => state,
+            Some(Err(e)) => return wrapper::log_decision("nosnap", &self.krate, &format!("before: {e:#}")),
+            None => return wrapper::log_decision("nosnap", &self.krate, "no-plan"),
+        };
         let began = SystemTime::now();
-        if let Ok(Some((files, bytes))) = self.try_snapshot(started) {
-            let ms = began.elapsed().map(|d| d.as_millis()).unwrap_or(0);
-            wrapper::log_decision("snapshot", &self.krate, &format!("files={files} bytes={bytes} ms={ms}"));
+        match self.try_snapshot(&before, started) {
+            Ok(Some((files, bytes))) => {
+                let ms = began.elapsed().map(|d| d.as_millis()).unwrap_or(0);
+                wrapper::log_decision("snapshot", &self.krate, &format!("files={files} bytes={bytes} ms={ms}"));
+            }
+            Ok(None) => {}
+            Err(e) => wrapper::log_decision("nosnap", &self.krate, &format!("{e:#}")),
         }
     }
 
@@ -186,25 +252,50 @@ impl Plan {
         unix_secs().saturating_sub(entry.stored_at) >= SNAPSHOT_INTERVAL.as_secs()
     }
 
-    fn try_snapshot(&self, started: SystemTime) -> Result<Option<(usize, u64)>> {
-        let Some((crate_dir, session)) = self.session_for(started)? else {
+    fn try_snapshot(&self, before: &[SessionState], started: SystemTime) -> Result<Option<(usize, u64)>> {
+        let mut changed: Vec<SessionState> = self
+            .session_state()?
+            .into_iter()
+            .filter(|now| !before.contains(now))
+            .filter(|now| now.session.as_ref().is_some_and(|(_, mtime)| *mtime >= started))
+            .collect();
+        if changed.is_empty() {
+            wrapper::log_decision("nosnap", &self.krate, "no-session");
             return Ok(None);
-        };
+        }
+        // The compiler that finished most recently wrote the newest session, and this invocation is
+        // the one that just exited. A library and its test build share an incremental directory and
+        // compile together, so under concurrent compiles the newest changed session can belong to the
+        // sibling rather than to this invocation. That costs a seed and nothing else: rustc discards a
+        // session whose command line differs, so it recompiles from scratch and never reuses foreign
+        // state. Two sessions with the same timestamp cannot be told apart at all, and picking one
+        // blind could hand this lineage the other's state, so that case stores nothing.
+        changed.sort_by_key(|a| std::cmp::Reverse(session_time(a)));
+        if changed.len() > 1 && session_time(&changed[0]) == session_time(&changed[1]) {
+            wrapper::log_decision("nosnap", &self.krate, "ambiguous");
+            return Ok(None);
+        }
+        let state = changed.remove(0);
+        let (session, _) = state.session.clone().expect("a changed state has a session");
+        let crate_dir = state.dir;
         let mut files = Vec::new();
         let mut bytes = 0u64;
         self.collect(&crate_dir, &crate_dir.join(&session), &mut files, &mut bytes)?;
         // A finalized session is named `s-<a>-<b>-<hash>`; its lock is `s-<a>-<b>.lock`. rustc does
         // not load a session without it, so an entry that cannot carry one is not worth storing.
         let Some(lock) = lock_file(&crate_dir, &session) else {
+            wrapper::log_decision("nosnap", &self.krate, "no-lock");
             return Ok(None);
         };
         if let Some((file, len)) = self.record_file(&crate_dir, &lock)? {
             bytes += len;
             files.push(file);
         } else {
+            wrapper::log_decision("nosnap", &self.krate, "lock-unreadable");
             return Ok(None);
         }
         if files.is_empty() {
+            wrapper::log_decision("nosnap", &self.krate, "no-files");
             return Ok(None);
         }
         let entry = IncrEntry {
@@ -219,31 +310,29 @@ impl Plan {
         Ok(Some((entry.files.len(), bytes)))
     }
 
-    /// The crate directory and its newest finalized `s-*` session, when that session was written at
-    /// or after `started`.
-    fn session_for(&self, started: SystemTime) -> Result<Option<(PathBuf, String)>> {
+    /// Every `<crate>-*` directory of the incremental directory, with the newest finalized session
+    /// in each. Taken before and after a compile, the difference names the directory this invocation
+    /// wrote.
+    fn session_state(&self) -> Result<Vec<SessionState>> {
         let prefix = format!("{}-", self.krate);
-        let mut best: Option<(PathBuf, String, SystemTime)> = None;
-        for entry in fs::read_dir(&self.dir)?.flatten() {
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            // A fresh target has no incremental directory until the first compile creates one.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.starts_with(&prefix) {
-                continue;
-            }
             let dir = entry.path();
-            if !dir.is_dir() {
+            if !name.starts_with(&prefix) || !dir.is_dir() {
                 continue;
             }
-            let Some((session, mtime)) = newest_session(&dir) else {
-                continue;
-            };
-            if mtime < started {
-                continue;
-            }
-            if best.as_ref().is_none_or(|(_, _, t)| mtime > *t) {
-                best = Some((dir, session, mtime));
-            }
+            let session = newest_session(&dir);
+            out.push(SessionState { dir, session });
         }
-        Ok(best.map(|(dir, session, _)| (dir, session)))
+        out.sort_by(|a, b| a.dir.cmp(&b.dir));
+        Ok(out)
     }
 
     fn collect(&self, crate_dir: &Path, dir: &Path, out: &mut Vec<IncrFile>, bytes: &mut u64) -> Result<()> {
@@ -294,6 +383,20 @@ impl Plan {
         let single = matches!(parts.next(), Some(Component::Normal(_))) && parts.next().is_none();
         single && subdir.starts_with(&format!("{}-", self.krate))
     }
+}
+
+/// One crate directory of the incremental directory and the newest finalized session inside it.
+/// Equality covers the session's name and mtime, so a directory a compile wrote into compares
+/// different before and after.
+#[derive(PartialEq, Eq)]
+struct SessionState {
+    dir: PathBuf,
+    session: Option<(String, SystemTime)>,
+}
+
+/// The newest session's timestamp, or the epoch for a directory with no finalized session.
+fn session_time(state: &SessionState) -> SystemTime {
+    state.session.as_ref().map(|(_, mtime)| *mtime).unwrap_or(UNIX_EPOCH)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -353,6 +456,25 @@ fn profile_name(out_dir: &Path) -> Result<String> {
             .context("no profile directory");
     }
     name(out_dir).context("no profile directory")
+}
+
+/// The manifest path relative to the nearest enclosing workspace root, when there is one. The root
+/// is the first ancestor whose `Cargo.toml` declares a `[workspace]` table; a package outside any
+/// workspace has none, and `<outside>` is recorded for it instead.
+fn workspace_relative(manifest: &Path) -> Option<String> {
+    for dir in manifest.ancestors() {
+        let Ok(text) = fs::read_to_string(dir.join("Cargo.toml")) else {
+            continue;
+        };
+        if !text.lines().any(|line| line.trim_start().starts_with("[workspace")) {
+            continue;
+        }
+        return manifest
+            .strip_prefix(dir)
+            .ok()
+            .map(|rel| rel.to_string_lossy().into_owned());
+    }
+    None
 }
 
 /// The lock file rustc keeps next to a session: its stem is the session's name without the
