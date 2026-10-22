@@ -776,10 +776,30 @@ fn linker_identity(linker: Option<&str>) -> Option<Digest> {
 
 pub(crate) fn find_program(name: &Path) -> Option<PathBuf> {
     if name.components().count() > 1 {
-        return name.is_file().then(|| name.to_path_buf());
+        return executable(name).then(|| name.to_path_buf());
     }
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|d| d.join(name)).find(|p| p.is_file())
+    std::env::split_paths(&path)
+        .map(|d| d.join(name))
+        .find(|p| executable(p))
+}
+
+fn executable(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 struct DepInfo {

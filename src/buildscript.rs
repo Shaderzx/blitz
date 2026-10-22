@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -35,7 +35,7 @@ use crate::wrapper;
 /// The cache namespace holding one entry per build-script run. Blobs live in the shared CAS, so
 /// `blitz gc` trims them with everything else.
 const NAMESPACE: &str = "bsrun";
-const KEY_DOMAIN: &str = "blitz-bsrun-v2";
+const KEY_DOMAIN: &str = "blitz-bsrun-v3";
 
 /// Programs a build script or the C tooling behind it runs. Their identity is part of the key: a new
 /// compiler changes the objects the script produces without changing the script.
@@ -80,20 +80,24 @@ pub fn main(args: &[OsString]) -> i32 {
     };
     let real = Path::new(first);
     let rest = &args[1..];
-    if disabled() || !real.is_file() {
-        return run_real(real, rest);
+    if disabled() {
+        return wrapper::run_program(real.as_os_str(), rest);
+    }
+    if !real.is_file() {
+        return wrapper::run_program(real.as_os_str(), rest);
     }
     let Ok(ctx) = Ctx::new(real) else {
         // The key cannot be established, so the run cannot be cached: behave as if blitz were absent.
         return run_real(real, rest);
     };
     match ctx.lookup() {
-        Ok(Some(())) => {
+        Ok(Lookup::Hit) => {
             ctx.log("bsrun-hit", "restored");
             ctx.stats("bsrun-hit");
             0
         }
-        Ok(None) => ctx.run(real, rest),
+        Ok(Lookup::Miss) => ctx.run(real, rest),
+        Ok(Lookup::ReplayError) => 1,
         // A cache that cannot be read is not the script's problem; run it and store what it says.
         Err(e) => {
             ctx.log("bsrun-miss", &format!("lookup-error: {e:#}"));
@@ -106,10 +110,8 @@ fn disabled() -> bool {
     env::var("BLITZ_BUILD_SCRIPT_RUN").is_ok_and(|v| v == "off") || env::var("BLITZ_DISABLE").is_ok_and(|v| v == "1")
 }
 
-/// Runs the real script with nothing cached in front of it, after telling the shim that blitz is the
-/// one running it.
+/// Runs the real script with nothing cached in front of it.
 fn run_real(real: &Path, args: &[OsString]) -> i32 {
-    mark_started();
     wrapper::run_program(real.as_os_str(), args)
 }
 
@@ -228,6 +230,12 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
 }
 
 /// Everything one run needs: the key, where its outputs go and how to name it in the log.
+enum Lookup {
+    Hit,
+    Miss,
+    ReplayError,
+}
+
 struct Ctx {
     store: Store,
     key: Digest,
@@ -248,18 +256,33 @@ impl Ctx {
         // OUT_DIR is the run's output location and a build script often prints it into what cargo
         // parses. CI spells it identically on every run; another path is another key.
         k.part("out-dir", out_dir.as_os_str().as_encoded_bytes());
-        for (name, value) in selected_env(env::var("CARGO_PKG_NAME").ok().as_deref()) {
-            k.part("env", format!("{name}={value}").as_bytes());
-            if native_tool_env(&name) {
-                // A command with arguments or an unresolved override is ambiguous. Run uncached.
+        for (name, value) in selected_env(env::var("CARGO_PKG_NAME").ok().as_deref())? {
+            k.part("env-name", name.as_bytes());
+            k.part("env-value", value.as_os_str().as_encoded_bytes());
+            if executable_override(&name) {
+                let text = value.to_str().context("native tool override is not UTF-8")?;
+                if text.is_empty() || text.chars().any(char::is_whitespace) {
+                    bail!("native tool override is not a plain executable: {name}");
+                }
                 let path = wrapper::find_program(Path::new(&value)).context("unresolved native tool override")?;
                 let path = fs::canonicalize(path)?;
                 k.part("selected-tool-path", path.as_os_str().as_encoded_bytes());
                 k.digest("selected-tool", &Digest::of_file(&path)?);
             }
         }
+        if let Some(path) = env::var_os("PATH") {
+            k.part("path", path.as_encoded_bytes());
+        } else {
+            k.part("path", b"<unset>");
+        }
+        let target = env::var_os("TARGET");
+        let host = env::var_os("HOST");
         for tool in TOOLS {
-            k.part("tool", &tool_identity(Path::new(tool)));
+            k.part("tool-name", tool.as_bytes());
+            k.part(
+                "tool",
+                &effective_tool_identity(tool, target.as_deref(), host.as_deref()),
+            );
         }
         Ok(Ctx {
             store,
@@ -270,52 +293,46 @@ impl Ctx {
         })
     }
 
-    /// Restores `OUT_DIR` and the recorded streams. `Some(())` means the run never has to happen;
-    /// `None` is an ordinary miss; an error is a miss too, and the caller then runs the script.
-    fn lookup(&self) -> Result<Option<()>> {
+    /// Restores `OUT_DIR` and the recorded streams. A replay failure is fatal after stdout starts.
+    fn lookup(&self) -> Result<Lookup> {
         let Some(entry) = self.store.get_entry::<BsEntry>(NAMESPACE, &self.key) else {
             self.log("bsrun-miss", "no-entry");
-            return Ok(None);
+            return Ok(Lookup::Miss);
         };
         if !valid_entry(&entry) {
             self.log("bsrun-miss", "entry-invalid");
-            return Ok(None);
+            return Ok(Lookup::Miss);
         }
         if !env_matches(&entry.env_deps) {
             self.log("bsrun-miss", "env-changed");
-            return Ok(None);
+            return Ok(Lookup::Miss);
         }
         if !paths_match(&entry.paths) {
             self.log("bsrun-miss", "path-changed");
-            return Ok(None);
+            return Ok(Lookup::Miss);
         }
         if !self.blobs_present(&entry) {
             self.log("bsrun-miss", "blobs-missing");
-            return Ok(None);
+            return Ok(Lookup::Miss);
         }
         if !self.out_dir_empty() {
             // Files already there belong to this run, whatever the key says.
             self.log("bsrun-miss", "out-dir-not-empty");
-            return Ok(None);
+            return Ok(Lookup::Miss);
         }
         if let Err(e) = self.restore(&entry) {
-            // Undo a half-written restore so the real script starts from the empty directory cargo
-            // gave it.
             let _ = fs::remove_dir_all(&self.out_dir);
             let _ = fs::create_dir_all(&self.out_dir);
             self.log("bsrun-miss", &format!("restore-error: {e:#}"));
-            return Ok(None);
+            return Ok(Lookup::Miss);
         }
         // Cargo parses these bytes; they are replayed exactly as recorded, on the same streams.
+        // A stdout failure may have emitted directives, so never fall back to the real script.
         if let Err(e) = self.replay(&entry) {
-            // The restore had already written a run this caller is about to repeat, so put OUT_DIR
-            // back the way cargo made it: a script that starts on its own previous output can fail
-            // where it would have succeeded.
-            let _ = fs::remove_dir_all(&self.out_dir);
-            let _ = fs::create_dir_all(&self.out_dir);
-            return Err(e.into());
+            eprintln!("blitz: replaying cached build-script output failed: {e}");
+            return Ok(Lookup::ReplayError);
         }
-        Ok(Some(()))
+        Ok(Lookup::Hit)
     }
 
     /// Replays the recorded streams. Cargo parses stdout, so it goes out first and byte for byte;
@@ -411,7 +428,6 @@ impl Ctx {
     /// succeeded. The exit code is always the script's.
     fn run(&self, real: &Path, args: &[OsString]) -> i32 {
         let started_empty = self.out_dir_empty();
-        mark_started();
         let mut child = match Command::new(real)
             .args(args)
             .stdin(Stdio::inherit())
@@ -419,7 +435,10 @@ impl Ctx {
             .stderr(Stdio::piped())
             .spawn()
         {
-            Ok(child) => child,
+            Ok(child) => {
+                mark_started();
+                child
+            }
             Err(e) => {
                 eprintln!("blitz: cannot run {}: {e}", real.display());
                 return 1;
@@ -447,6 +466,7 @@ impl Ctx {
             }
         };
         self.log("bsrun-miss", &format!("ran exit={code}"));
+        self.stats("bsrun-miss");
         if code == 0 && started_empty {
             match (stdout, stderr) {
                 (Ok(stdout), Ok(stderr)) => {
@@ -563,7 +583,7 @@ impl Ctx {
         for line in stdout.lines() {
             let line = line.trim_end_matches('\r');
             if let Some(name) = instruction(line, "rerun-if-env-changed") {
-                let value = env::var_os(name).map(|v| v.to_string_lossy().into_owned());
+                let value = env::var_os(name).map(|v| v.as_encoded_bytes().to_vec());
                 env_deps.push((name.to_string(), value));
             } else if let Some(value) = instruction(line, "rerun-if-changed") {
                 let path = Path::new(value);
@@ -606,7 +626,7 @@ impl Ctx {
 /// What a stored run said it watches: the `cargo:rerun-if-env-changed` names with the value the run
 /// saw, and the `cargo:rerun-if-changed` paths outside the crate with the digest of what they held.
 struct Watched {
-    env: Vec<(String, Option<String>)>,
+    env: Vec<(String, Option<Vec<u8>>)>,
     paths: Vec<BsPath>,
 }
 
@@ -615,7 +635,7 @@ struct BsEntry {
     files: Vec<BsFile>,
     /// `cargo:rerun-if-env-changed` names with the value the recorded run saw.
     #[serde(default)]
-    env_deps: Vec<(String, Option<String>)>,
+    env_deps: Vec<(String, Option<Vec<u8>>)>,
     /// `cargo:rerun-if-changed` paths outside the crate, with the digest of what they held.
     #[serde(default)]
     paths: Vec<BsPath>,
@@ -683,18 +703,20 @@ fn env_path(name: &str) -> Result<PathBuf> {
 }
 
 /// The environment cargo set for this run, plus the variables a build script's C tooling reads.
-fn selected_env(pkg: Option<&str>) -> Vec<(String, String)> {
+fn selected_env(pkg: Option<&str>) -> Result<Vec<(String, OsString)>> {
     let prefix = pkg.map(|p| p.to_uppercase().replace('-', "_"));
     let mut out = Vec::new();
     for (key, value) in env::vars_os() {
-        let name = key.to_string_lossy().into_owned();
-        if !cargo_env(&name, prefix.as_deref()) {
+        let Some(name) = key.to_str() else {
+            bail!("selected environment name is not UTF-8");
+        };
+        if !cargo_env(name, prefix.as_deref()) {
             continue;
         }
-        out.push((name, value.to_string_lossy().into_owned()));
+        out.push((name.to_owned(), value));
     }
-    out.sort();
-    out
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
 }
 
 fn cargo_env(name: &str, prefix: Option<&str>) -> bool {
@@ -732,6 +754,27 @@ fn cargo_env(name: &str, prefix: Option<&str>) -> bool {
 /// that is not there is recorded as absent, so installing it later changes the key. The path is
 /// canonicalised first, so a link that starts pointing at another tool changes the identity even when
 /// the link itself, its size and its mtime stay put.
+fn effective_tool_identity(tool: &str, target: Option<&OsStr>, host: Option<&OsStr>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for candidate in tool_candidates(tool, target, host) {
+        out.extend_from_slice(candidate.as_os_str().as_encoded_bytes());
+        out.push(0);
+        out.extend_from_slice(&tool_identity(&candidate));
+        out.push(0xff);
+    }
+    out
+}
+
+fn tool_candidates(tool: &str, target: Option<&OsStr>, host: Option<&OsStr>) -> Vec<PathBuf> {
+    let mut names = Vec::new();
+    for triple in [target, host].into_iter().flatten() {
+        let triple = triple.to_string_lossy();
+        names.push(PathBuf::from(format!("{triple}-{tool}")));
+    }
+    names.push(PathBuf::from(tool));
+    names
+}
+
 fn tool_identity(name: &Path) -> Vec<u8> {
     let Some(path) = wrapper::find_program(name) else {
         return b"absent".to_vec();
@@ -746,9 +789,9 @@ fn tool_identity(name: &Path) -> Vec<u8> {
     out
 }
 
-fn env_matches(recorded: &[(String, Option<String>)]) -> bool {
+fn env_matches(recorded: &[(String, Option<Vec<u8>>)]) -> bool {
     recorded.iter().all(|(name, value)| {
-        let current = env::var_os(name).map(|v| v.to_string_lossy().into_owned());
+        let current = env::var_os(name).map(|v| v.as_encoded_bytes().to_vec());
         current.as_ref() == value.as_ref()
     })
 }
@@ -805,14 +848,15 @@ fn path_digest(path: &Path) -> Result<Option<Digest>> {
     }
 }
 
-fn native_tool_env(name: &str) -> bool {
+fn executable_override(name: &str) -> bool {
     let bare = name
         .strip_prefix("TARGET_")
         .or_else(|| name.strip_prefix("HOST_"))
         .unwrap_or(name);
-    ["CC", "CXX", "AR"]
+    ["CC", "CXX", "AR", "PKG_CONFIG", "RUSTC", "RUSTC_LINKER"]
         .iter()
         .any(|base| bare == *base || bare.strip_prefix(base).is_some_and(|rest| rest.starts_with('_')))
+        || matches!(name, "CMAKE_C_COMPILER" | "CMAKE_CXX_COMPILER" | "CMAKE_LINKER")
 }
 
 fn label_of(real: &Path) -> String {

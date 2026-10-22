@@ -93,7 +93,7 @@ without spawning rustup in the common case.
    with every build. `NotFound` is the only "absent"; any other read error
    means no entry is stored. Every `Cargo.toml` and `Cargo.lock` under the root is keyed even when
    git-ignored. File-valued `--config` falls back to plain
-   cargo (inline `key=value` is keyed as a string). Entries carry `ENTRY_VERSION` 3, so entries
+   cargo (inline `key=value` is keyed as a string). Entries carry `ENTRY_VERSION` 4, so entries
    from before these rules are never reused. A build that starts without a `Cargo.lock` stores no
    entry: cargo writes the lock during that build, so the recorded key could never be looked up.
    On a hit, every artifact path must be relative with only normal components; anything else is
@@ -209,25 +209,25 @@ crate that builds C in its build script that run dominates: on engine's CI build
    the real script when blitz exits non-zero without a marker. A non-zero exit alone also describes
    a script that failed, or blitz killed by the kernel. Running a script that already ran a
    second time repeats its side effects and its output. blitz therefore touches
-   `$BLITZ_BSRUN_MARK`, `<real>.blitz-mark.$$` beside the real binary, immediately before it starts
-   the real script, whether or not the run is cached, and never removes it: the shim does. The marker
+   `$BLITZ_BSRUN_MARK`, `<real>.blitz-mark.$$` beside the real binary, after successfully spawning
+   the real script, and never removes it: the shim does. The marker
    lives in cargo's own writable build directory, so a `$TMPDIR` that cannot be written cannot cost
    the fallback its precision. A marker means the script is what produced the code, or is producing
    it. Without a marker after a non-zero exit, the shim assumes nothing ran and execs the script.
    An exit of zero removes the marker and exits 0. If the shim itself is killed, its marker can remain under
-   target until cargo cleans it. A signal between writing the marker and spawning the real script
-   can suppress fallback even though the script has not started. The marker prevents duplicate runs
-   after spawn; it cannot make marking and spawning atomic. If writing the marker fails, a non-zero
-   exit can still cause a duplicate run. Path and workspace crates keep the plain executable, because
-   cargo recompiles their build script whenever their sources change and their runs are not
-   the expensive ones. The per-unit entry stores the real binary (mode 0755) under the hashed
+   target until cargo cleans it.
+   The marker prevents duplicate runs after spawn; it cannot make marking and spawning atomic. If
+   writing the marker fails, a non-zero exit can still cause a duplicate run. Path and workspace crates
+   keep the plain executable, because cargo recompiles their build script whenever their sources change
+   and their runs are not the expensive ones. The per-unit entry stores the real binary (mode 0755)
+   under the hashed
    executable name cargo gave the script (`build_script_build-<meta>`), the name it had before the
    shim replaced it and the name v0.2 stored, and never the shim; a restore writes the shim fresh, so
    it names the blitz doing the restoring, and a v0.2 binary can still read a v0.3 entry. Only that
    executable uses the real path and mode 0755. Extra outputs, including split-debuginfo object files,
    keep their own names and mode 0644.
 
-2. **Key** (domain `blitz-bsrun-v2`, so pre-fix entries with incomplete dependencies or streams are not reused):
+2. **Key** (domain `blitz-bsrun-v3`, so entries from before tool, environment and replay fixes are not reused):
    - the BLAKE3 digest of the real executable (a recompile, a new compiler or a new linker changes it);
    - `OUT_DIR` as a literal path (CI spells it identically on every run; another path is another key);
    - every environment variable cargo sets for a build script (`CARGO_*`, plus `TARGET`, `HOST`,
@@ -241,12 +241,13 @@ crate that builds C in its build script that run dominates: on engine's CI build
    - every variable named after the crate (`AWS_LC_SYS_*`, `RING_*`): `CARGO_PKG_NAME` upper-cased
      with `-` as `_`, followed by `_`;
    - the identity (real path, size, mtime) of `cc`, `c++`, `cmake`, `ar`, `ld`, `perl`, `pkg-config`,
-     `make`, `python3`, `protoc`, `nasm`, `clang` and `git` on `PATH`, or the fact that one is
-     absent. Each path is canonicalised before it is recorded, so a symlink that starts pointing at
-     another tool changes the key. Explicit `CC`, `CXX` and `AR` selections, including their
-     target-specific and `TARGET_`/`HOST_` forms, also contribute their resolved path and content
-     digest. An unresolved selection, including a command string that is not a single resolvable
-     executable, bypasses the run cache.
+     `make`, `python3`, `protoc`, `nasm`, `clang` and `git` on `PATH`, plus the effective
+     target-prefixed and host-prefixed names selected from `TARGET` and `HOST`, or the fact that one
+     is absent. The raw `PATH` also enters the key. Each path is canonicalised before it is recorded,
+     and the resolver requires execute permission, so a symlink or replacement tool changes the key.
+     Explicit executable overrides, including `CC`, `CXX`, `AR`, `PKG_CONFIG`, `RUSTC` and
+     `RUSTC_LINKER` forms, contribute their resolved path and content digest. An unresolved selection,
+     command string, or non-UTF-8 selection bypasses the run cache.
 
 3. **Direct mode.** The stdout of a stored run is parsed for `cargo:rerun-if-env-changed=NAME` and
    `cargo:rerun-if-changed=PATH`. Each name is stored with the value the run saw, and each path
@@ -264,19 +265,19 @@ crate that builds C in its build script that run dominates: on engine's CI build
    parsing trims the complete line and its value, matching Cargo's whitespace handling.
 
 4. **Hit.** Only into an empty or missing `OUT_DIR`; anything already there belongs to this run, so the
-   real script runs instead. Files are materialized with their recorded modes, directories are
-   recreated from entries of their own (an empty one has no file to carry it), and symlinks are
-   recreated with their targets: a link that resolves to a file is stored with the digest of that
-   target and verified on every lookup, and a link to a directory or a special file makes the run
-   uncacheable. Regular files and directories are restored before links. All links are created
-   before their target digests are checked, so forward references and link chains work. An explicitly
-   recorded dangling link must still return `NotFound`; a target appearing later rejects the hit.
-   Before any writes, validation rejects non-normal names, normalized duplicate names, conflicting
-   types and any non-directory ancestor of another entry. Leaf symlinks may target external files,
-   but restoration never writes through them. Directory modes are applied deepest-first after the
-   tree is populated and links are checked. Cargo parses the recorded stdout, so it is replayed
-   byte for byte, with the recorded stderr after it. A restore that fails halfway removes
-   and recreates `OUT_DIR`, so the real script starts from the empty directory cargo gave it.
+   real script runs instead. Cargo directives replay before output restoration. If directive replay
+   fails after stdout starts, blitz returns an error and never runs the real script a second time.
+   Files are materialized with their recorded modes, directories are recreated from entries of their
+   own (an empty one has no file to carry it), and symlinks are recreated with their targets: a link
+   that resolves to a file is stored with the digest of that target and verified on every lookup, and
+   a link to a directory or a special file makes the run uncacheable. Regular files and directories
+   are restored before links. All links are created before their target digests are checked, so forward
+   references and link chains work. An explicitly recorded dangling link must still return `NotFound`;
+   a target appearing later rejects the hit. Before any writes, validation rejects non-normal names,
+   normalized duplicate names, conflicting types and any non-directory ancestor of another entry.
+   Leaf symlinks may target external files, but restoration never writes through them. Directory modes
+   are applied deepest-first after the tree is populated and links are checked. A restore that fails
+   removes and recreates `OUT_DIR` before the caller can run the real script.
 
 5. **Miss.** The real binary runs with the same arguments, environment, working directory and stdin;
    its stdout and stderr are forwarded as they arrive and recorded; its exit code is returned
@@ -289,9 +290,9 @@ crate that builds C in its build script that run dominates: on engine's CI build
    binary, so a broken cache can cost a run and never a build.
 
 6. Log `bsrun-hit`, `bsrun-miss` and `bsrun-store` to `$BLITZ_LOG` in the usual format and count them
-   in `blitz stats`. `BLITZ_BUILD_SCRIPT_RUN=off` and `BLITZ_DISABLE=1` take the real binary even when
-   blitz is there. Runs live in `ac/bsrun/` with their blobs in `cas/`, so `blitz gc` trims them with
-   everything else.
+   in `blitz stats`. Each real script run counts one `bsrun-miss`, even when storing fails.
+   `BLITZ_BUILD_SCRIPT_RUN=off` and `BLITZ_DISABLE=1` take the real binary even when blitz is there.
+   Runs live in `ac/bsrun/` with their blobs in `cas/`, so `blitz gc` trims them with everything else.
 
 What still misses: a registry crate whose build script reads something outside the key (the machine's
 `/usr/include`, the time of day, a network response) produces the same key with different bytes;

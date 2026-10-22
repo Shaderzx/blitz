@@ -23,8 +23,8 @@ use crate::store::Store;
 use crate::toolchain;
 
 const NAMESPACE: &str = "whole";
-const ENTRY_VERSION: u32 = 3;
-const KEY_DOMAIN: &str = "blitz-whole-v1";
+const ENTRY_VERSION: u32 = 4;
+const KEY_DOMAIN: &str = "blitz-whole-v2";
 
 /// Variables whose value can change output bytes, on top of everything prefixed `CARGO_`.
 const KEY_ENV: &[&str] = &[
