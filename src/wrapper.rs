@@ -26,6 +26,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::depinfo;
+use crate::file_metadata::mtime_ns;
 use crate::hash::{Digest, KeyBuilder};
 use crate::normalize::{self, Normalizer};
 use crate::store::Store;
@@ -74,6 +75,32 @@ const VALUE_FLAGS: &[&str] = &[
     "--forbid",
     "--feature",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::{Incremental, parse};
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    #[test]
+    fn incremental_flags_keep_the_named_directory() {
+        let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(matches!(parse(&[]).incremental, Incremental::Off));
+        assert!(matches!(
+            parse(&args(&["-C", "incremental"])).incremental,
+            Incremental::Unspecified
+        ));
+        for flags in [
+            vec!["-Cincremental=target/incr", "-C", "incremental"],
+            vec!["-C", "incremental", "-Cincremental=target/incr"],
+        ] {
+            assert!(matches!(
+                parse(&args(&flags)).incremental,
+                Incremental::Directory(path) if path == Path::new("target/incr")
+            ));
+        }
+    }
+}
 
 /// Short options that accept a glued value, as in `-Cincremental=dir` or `-Dwarnings`.
 const GLUED_FLAGS: &[&str] = &["-C", "-Z", "-L", "-l", "-W", "-A", "-D", "-F"];
@@ -135,7 +162,7 @@ pub fn chained(args: &[OsString]) -> Option<i32> {
         return Some(run_program(first, &args[1..]));
     }
     let inv = parse(rest);
-    if inv.incremental && inv.incremental_dir.is_some() {
+    if matches!(inv.incremental, Incremental::Directory(_)) {
         return Some(crate::incremental::run(real, Some(first), rest, &inv));
     }
     Some(run_program(first, &args[1..]))
@@ -147,18 +174,13 @@ pub fn main(rustc: &OsStr, args: &[OsString]) -> i32 {
         Ok(Outcome::Done(code)) => code,
         Ok(Outcome::Pass(reason)) => {
             log_decision("pass", &krate, reason);
-            passthrough(rustc, args)
+            run_program(rustc, args)
         }
         Err(e) => {
             log_decision("pass", &krate, &format!("error: {e:#}"));
-            passthrough(rustc, args)
+            run_program(rustc, args)
         }
     }
-}
-
-/// Runs the real compiler with the original arguments, inheriting stdio.
-pub fn passthrough(rustc: &OsStr, args: &[OsString]) -> i32 {
-    run_program(rustc, args)
 }
 
 /// Runs `program` with `args`, inheriting stdio, and returns its exit code (1 when it cannot start).
@@ -192,12 +214,13 @@ fn run(rustc: &OsStr, args: &[OsString]) -> Result<Outcome> {
     if inv.inputs.iter().any(|i| i == "-") {
         return Ok(Outcome::Pass("stdin-input"));
     }
-    if inv.incremental {
-        if inv.incremental_dir.is_some() {
+    match &inv.incremental {
+        Incremental::Directory(_) => {
             // Seeding and snapshotting happen around the compiler, which still runs every time.
             return Ok(Outcome::Done(crate::incremental::run(rustc, None, args, &inv)));
         }
-        return Ok(Outcome::Pass("incremental"));
+        Incremental::Unspecified => return Ok(Outcome::Pass("incremental")),
+        Incremental::Off => {}
     }
     // A build script is the one `bin` unit whose output is a function of its sources and the
     // linker: cargo names it `build_script_*` and never links anything of the user's into it.
@@ -598,6 +621,14 @@ impl Ctx<'_> {
 }
 
 #[derive(Default)]
+pub(crate) enum Incremental {
+    #[default]
+    Off,
+    Unspecified,
+    Directory(PathBuf),
+}
+
+#[derive(Default)]
 pub(crate) struct Invocation {
     pub(crate) crate_name: Option<String>,
     pub(crate) out_dir: Option<PathBuf>,
@@ -605,10 +636,8 @@ pub(crate) struct Invocation {
     pub(crate) linker: Option<String>,
     pub(crate) emit: Vec<String>,
     pub(crate) crate_types: Vec<String>,
-    /// True for both `-C incremental` forms, which keep the unit out of the per-unit cache.
-    pub(crate) incremental: bool,
-    /// The `-C incremental=<dir>` value, when the build named one.
-    pub(crate) incremental_dir: Option<PathBuf>,
+    /// Both `-C incremental` forms keep the unit out of the per-unit cache.
+    pub(crate) incremental: Incremental,
     pub(crate) test: bool,
     pub(crate) target: Option<String>,
     pub(crate) externs: Vec<(String, String)>,
@@ -661,10 +690,11 @@ fn parse(args: &[OsString]) -> Invocation {
                     inv.linker = Some(rest.to_string());
                 }
                 if value == "incremental" {
-                    inv.incremental = true;
+                    if matches!(inv.incremental, Incremental::Off) {
+                        inv.incremental = Incremental::Unspecified;
+                    }
                 } else if let Some(rest) = value.strip_prefix("incremental=") {
-                    inv.incremental = true;
-                    inv.incremental_dir = Some(PathBuf::from(rest));
+                    inv.incremental = Incremental::Directory(PathBuf::from(rest));
                 }
             }
             _ => {}
@@ -1043,14 +1073,6 @@ fn memo_path(target_root: &Path, path: &Path) -> Result<PathBuf> {
         .file_name()
         .with_context(|| format!("{} has no file name", path.display()))?;
     Ok(target_root.join("blitz").join("digests").join(name))
-}
-
-fn mtime_ns(meta: &fs::Metadata) -> u64 {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
 }
 
 fn scan_out_dir(out_dir: &Path, prefixes: &[String]) -> HashMap<String, (u64, u64)> {

@@ -28,6 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::file_metadata::{mode_of, mtime_ns};
 use crate::hash::{Digest, KeyBuilder};
 use crate::store::Store;
 use crate::wrapper;
@@ -88,7 +89,7 @@ pub fn main(args: &[OsString]) -> i32 {
     }
     let Ok(ctx) = Ctx::new(real) else {
         // The key cannot be established, so the run cannot be cached: behave as if blitz were absent.
-        return run_real(real, rest);
+        return wrapper::run_program(real.as_os_str(), rest);
     };
     match ctx.lookup() {
         Ok(Lookup::Hit) => {
@@ -108,11 +109,6 @@ pub fn main(args: &[OsString]) -> i32 {
 
 fn disabled() -> bool {
     env::var("BLITZ_BUILD_SCRIPT_RUN").is_ok_and(|v| v == "off") || env::var("BLITZ_DISABLE").is_ok_and(|v| v == "1")
-}
-
-/// Runs the real script with nothing cached in front of it.
-fn run_real(real: &Path, args: &[OsString]) -> i32 {
-    wrapper::run_program(real.as_os_str(), args)
 }
 
 /// Leaves a marker at the path the shim passed in `BLITZ_BSRUN_MARK`. The shim falls back to the
@@ -898,25 +894,6 @@ fn pump<R: Read>(pipe: Option<R>, to_stderr: bool) -> io::Result<Vec<u8>> {
         io::stdout().flush()?;
     }
     Ok(out)
-}
-
-#[cfg(unix)]
-fn mode_of(meta: &fs::Metadata) -> u32 {
-    use std::os::unix::fs::PermissionsExt;
-    meta.permissions().mode() & 0o777
-}
-
-#[cfg(not(unix))]
-fn mode_of(_meta: &fs::Metadata) -> u32 {
-    0o644
-}
-
-fn mtime_ns(meta: &fs::Metadata) -> u64 {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
 }
 
 fn unix_secs() -> u64 {
