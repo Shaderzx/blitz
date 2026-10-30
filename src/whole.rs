@@ -211,7 +211,7 @@ fn key_of(
     match inputs::cargo_binary(&rustc).and_then(|cargo| fs::metadata(cargo).ok()) {
         Some(meta) => {
             key.part("cargo-len", &meta.len().to_le_bytes());
-            key.part("cargo-mtime", &inputs::mtime_ns(&meta).to_le_bytes());
+            key.part("cargo-mtime", &crate::file_metadata::mtime_ns(&meta).to_le_bytes());
         }
         None => {
             key.part("cargo", b"unresolved");

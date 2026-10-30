@@ -18,10 +18,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::file_metadata::{mode_of, mtime_ns};
 use crate::hash::{Digest, KeyBuilder};
 use crate::store::Store;
 use crate::toolchain;
-use crate::wrapper::{self, Invocation};
+use crate::wrapper::{self, Incremental, Invocation};
 
 /// How long a lineage's snapshot is left alone. A second build in the same tree would otherwise
 /// re-store state the next build is about to replace; CI asks for `always` so every run leaves the
@@ -71,7 +72,10 @@ struct Plan {
 impl Plan {
     fn new(rustc: &OsStr, wrapper: Option<&OsStr>, inv: &Invocation) -> Result<Plan> {
         let krate = inv.crate_name.clone().context("no crate name")?;
-        let dir = inv.incremental_dir.clone().context("no incremental directory")?;
+        let Incremental::Directory(dir) = &inv.incremental else {
+            bail!("no incremental directory");
+        };
+        let dir = dir.clone();
         let out_dir = inv.out_dir.as_deref().context("no --out-dir")?;
         let target_root = wrapper::target_root_of(out_dir).context("no target root")?;
         let store = Store::from_env()?;
@@ -547,25 +551,6 @@ fn unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-fn mtime_ns(meta: &fs::Metadata) -> u64 {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
-
-#[cfg(unix)]
-fn mode_of(meta: &fs::Metadata) -> u32 {
-    use std::os::unix::fs::PermissionsExt;
-    meta.permissions().mode() & 0o777
-}
-
-#[cfg(not(unix))]
-fn mode_of(_meta: &fs::Metadata) -> u32 {
-    0o644
 }
 
 fn unique() -> u64 {

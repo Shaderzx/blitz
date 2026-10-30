@@ -9,6 +9,7 @@
 mod buildscript;
 mod cli;
 mod depinfo;
+mod file_metadata;
 mod hash;
 mod incremental;
 mod inputs;

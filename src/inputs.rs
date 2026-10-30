@@ -9,12 +9,13 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 
+use crate::file_metadata::mtime_ns;
 use crate::hash::Digest;
 
 const STAT_CACHE_VERSION: u32 = 1;
@@ -612,14 +613,6 @@ fn key_of(rel: &Path) -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
-}
-
-pub fn mtime_ns(meta: &fs::Metadata) -> u64 {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
 }
 
 /// True when `meta`'s mtime is too close to now to tell later writes apart, including an mtime in
